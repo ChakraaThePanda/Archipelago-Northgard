@@ -12,7 +12,11 @@ from .Options import NorthgardOptions
 from .Rules import set_completion_rule
 
 
-def launch_client() -> None:
+def launch_client(*args) -> None:
+    # *args exists only so this matches the signature Component.run() always calls
+    # (self.func(*args) -- args is non-empty when the Launcher is invoked with extra
+    # CLI tokens after "--", e.g. a url). Not forwarded further: like Manual's own
+    # launch_client, the client reads sys.argv itself (see NorthgardClient.launch).
     from CommonClient import gui_enabled
     from .NorthgardClient import launch as Main
 

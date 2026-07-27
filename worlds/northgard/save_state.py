@@ -38,7 +38,7 @@ CHAPTER_ROWS: list[list[str]] = [
 class ConquestRunState:
     save_path: str
     clan: str
-    opponent_clan: str
+    partner_clan: str | None  # Conquest is co-op against the AI, not PvP -- None for a solo run
     completed_chapters: list[str]  # in tree order, e.g. ["Chapter 01", "Chapter 02 - Bottom", ...]
 
 
@@ -50,7 +50,7 @@ class ConquestSaveSummary:
     filename: str  # stable for the life of a run: "<Clan1>-<Clan2>-<difficulty>-<seed>.sav"
     path: str
     clan: str
-    opponent_clan: str
+    partner_clan: str | None  # Conquest is co-op against the AI, not PvP -- None for a solo run
     difficulty: int
     seed: int
     chapters_completed: int
@@ -67,12 +67,12 @@ def list_conquest_saves(northgard_save_dir: str) -> list[ConquestSaveSummary]:
                 obj = decode(f.read())
             players = obj.get("players", [])
             clan = players[0]["clan"] if players else obj.get("clan", "?")
-            opponent = players[1]["clan"] if len(players) > 1 else "?"
+            partner = players[1]["clan"] if len(players) > 1 else None
             summaries.append(ConquestSaveSummary(
                 filename=os.path.basename(path),
                 path=path,
                 clan=clan,
-                opponent_clan=opponent,
+                partner_clan=partner,
                 difficulty=obj.get("difficulty", -1),
                 seed=obj.get("seed", -1),
                 chapters_completed=len(obj.get("path", [])),
@@ -118,11 +118,11 @@ def read_conquest_run_state(save_file: str) -> ConquestRunState:
 
     players = obj.get("players", [])
     clan = players[0]["clan"] if players else obj.get("clan", "?")
-    opponent = players[1]["clan"] if len(players) > 1 else "?"
+    partner = players[1]["clan"] if len(players) > 1 else None
 
     return ConquestRunState(
         save_path=save_file,
         clan=clan,
-        opponent_clan=opponent,
+        partner_clan=partner,
         completed_chapters=completed,
     )
