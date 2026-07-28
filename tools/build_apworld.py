@@ -11,7 +11,12 @@ Usage:
     python tools/build_apworld.py <version>
 
 Example:
-    python tools/build_apworld.py 2026.07.28.2
+    python tools/build_apworld.py 2026.07.29
+
+world_version must be exactly 3 dot-separated integers (major.minor.build) --
+Archipelago core's Version is a fixed 3-field tuple, and a 4th segment crashes every
+player's client trying to load the world. The git tag you release under doesn't have
+to match this value, only the embedded world_version is constrained.
 
 Produces ./northgard.apworld (gitignored release artifact, matching the tag you'll
 create for the release).
@@ -21,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -29,8 +35,14 @@ MANIFEST_TEMPLATE = WORLD_DIR / "archipelago.json"
 OUTPUT = ROOT / "northgard.apworld"
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument("version", help="world_version for this release, e.g. 2026.07.28.2")
+parser.add_argument("version", help="world_version for this release -- exactly 3 dot-separated integers, e.g. 2026.07.29")
 args = parser.parse_args()
+
+if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
+    parser.error(
+        f"{args.version!r} must be exactly 3 dot-separated integers (major.minor.build) -- "
+        "Archipelago core's Version tuple can't hold a 4th segment and will crash loading this world."
+    )
 
 manifest = json.loads(MANIFEST_TEMPLATE.read_text(encoding="utf-8"))
 manifest["world_version"] = args.version
