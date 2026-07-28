@@ -21,18 +21,19 @@ install/connect walkthrough) for details. Quick version below.
    update ever reverts it).
 4. Run `/conquest` to pick your Conquest save for this playthrough, then play normally --
    checks send and Chapters unlock automatically.
+   - Make sure you have created your Conquest save first before using the `/conquest` command.
+  
+## Uninstall
 
 Want to play vanilla Northgard sometimes? Grab `patch_northgard.exe` and just double-click
 it -- it finds your Northgard install automatically and gives you a simple menu to check
 status or switch back to vanilla. The client only ever applies the patch automatically,
 never reverts it, so switching back to vanilla is always a deliberate, manual step.
 
-## Tips
+## Known Issues
 
 - If you're already sitting on the Conquest map when a Chapter unlocks (right after
   pinning a save, or right after receiving an item), back out to the main menu and back in
   (or reload the save) to see it reflected -- the map only checks what's unlocked when it
   first opens.
-- Make sure you have created your Conquest save first before using the `/conquest` command.
-- You can have several Conquest saves going at once; `/conquest` lists all of them so you
-  can tell them apart (clans, difficulty, how far along each one is).
+- After finishing a battle, you might see the animation where the next Chapter gets unlocked. It will show a Flag like you can play it, even if you haven't unlocked it yet. Going back to the main menu and back in will properly show the lock again.
