@@ -8,9 +8,11 @@
 
 ## Installation
 
-1. Place `northgard.apworld` in your Archipelago install's `custom_worlds` folder.
+1. Place `northgard.apworld` in your Archipelago install's `custom_worlds` folder. Every
+   player with a Northgard slot needs to do this on their own machine, even if someone
+   else is generating/hosting the room.
 2. Add a Northgard entry to your player YAML (`amount_of_locations`, `progression_mode`,
-   `chapter7_requirement`).
+   `chapter7_requirement`) -- see `Northgard.yaml` for a ready-to-use template.
 3. Generate or join a multiworld using your Northgard YAML.
 4. Open the Archipelago Launcher and click **Northgard Client** -- it's bundled inside the
    apworld, the same way as any other game's client.
@@ -21,6 +23,8 @@
 7. Run `/conquest` to see your in-progress Conquest saves and pick the one for this
    playthrough. This is remembered per Archipelago room, so running more than one room at
    once (each with its own client) doesn't mix up which save belongs to which.
+   - Make sure you have created your Conquest save in-game first -- `/conquest` can only
+     list saves that already exist.
 8. Leave the client running in the background while you play. It watches your pinned
    Northgard save directly; you don't need to manually report anything in-game.
 
@@ -35,7 +39,5 @@
   reverts it). It never reverts the patch itself: to play vanilla Northgard, just
   double-click the standalone `patch_northgard.exe` -- it finds your Northgard install
   automatically and gives you a menu to check status or restore to vanilla.
-- If you're already looking at the Conquest map when a Chapter becomes unlocked (right
-  after pinning a save, or right after receiving an item), back out to the main menu and
-  back in (or reload the save) to see it reflected -- the map only checks what's unlocked
-  when it first opens.
+
+See the root [README](../../../README.md#known-issues) for known issues.
