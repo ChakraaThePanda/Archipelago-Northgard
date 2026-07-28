@@ -22,7 +22,7 @@
 
 use anyhow::{bail, Context, Result};
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Reg, RefFun, RefInt, RefString};
+use hlbc::types::{Reg, RefField, RefFun, RefInt, RefString, RefType};
 use hlbc::Bytecode;
 use std::env;
 use std::fs;
@@ -34,6 +34,30 @@ const GATE_FINDEX: usize = 8760; // Conquest.getBattleState
 const STRING_ADD_FINDEX: usize = 21; // String.__add__
 const GET_PATH_FINDEX: usize = 16543; // sys.FileSystem's path-normalizing helper
 const SYS_EXISTS_FINDEX: usize = 16542; // native sys_exists
+
+// Live-refresh patch (see patch_map_auto_refresh below): every frame, re-check and
+// re-render every node on the open Conquest map instead of only at construction time.
+const UPDATE_FINDEX: usize = 28486; // ConquestMapContent.update(dt)
+const CHANGE_STATE_FINDEX: usize = 28498; // MapButton.changeState(state, onDone)
+const HAS_NEXT_TO_UNLOCK_FINDEX: usize = 28481; // ConquestMapContent.hasNextToUnlock -- source of the Conquest/MapContainer/enum<BattleState> reg types and the `conquest`/`container` field indices, all on the same class as `update`
+const GET_BUTTON_FINDEX: usize = 28512; // MapContainer.getButton -- source of the ArrayObj/dynamic/array/MapButton reg types and the `buttons` field index
+const GET_BUTTON_BY_ID_FINDEX: usize = 28513; // MapContainer.getButtonById -- source of the Battle/virtual/String reg types and the `data`/`infId` field indices
+
+// Post-battle "reveal" animation fix: ConquestMapContent.animateNewBattlePlots hardcodes
+// every next-column node to Unlocked (global(6241)) regardless of whether it's actually
+// allowed -- see patch_reveal_uses_real_state below.
+const ANIMATE_NEW_BATTLE_PLOTS_FINDEX: usize = 28476;
+const ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP: usize = 46;
+const GLOBAL_UNLOCKED: usize = 6241;
+
+const FIELD_CMC_CONQUEST: usize = 19; // ConquestMapContent.conquest
+const FIELD_CMC_CONTAINER: usize = 13; // ConquestMapContent.container
+const FIELD_MAPCONTAINER_BUTTONS: usize = 79; // MapContainer.buttons (nested column/row array of MapButton)
+const FIELD_ARRAYOBJ_LENGTH: usize = 0; // hl.types.ArrayObj.length
+const FIELD_ARRAYOBJ_ARRAY: usize = 1; // hl.types.ArrayObj.array (raw backing array)
+const FIELD_MAPBUTTON_DATA: usize = 108; // MapButton.data -> gamesys.conquest.Battle
+const FIELD_BATTLE_DATA: usize = 0; // Battle.data -> virtual{infId, ...}
+const FIELD_BATTLEDATA_INFID: usize = 1; // virtual{infId, ...}.infId
 
 const UNLOCK_SUBDIR: &str = "unlocked";
 const NON_LINEAR_FLAG_NAME: &str = "non_linear_mode.flag";
@@ -65,6 +89,14 @@ fn main() -> Result<()> {
         "findcallers" => {
             let findex: usize = args.get(3).context("usage: patch_northgard findcallers <dir> <findex>")?.parse()?;
             cmd_findcallers(&backup_path, &live_path, findex)
+        }
+        "dump" => {
+            let findex: usize = args.get(3).context("usage: patch_northgard dump <dir> <findex>")?.parse()?;
+            cmd_dump(&backup_path, &live_path, findex)
+        }
+        "list" => {
+            let needle = args.get(3).context("usage: patch_northgard list <dir> <source-file-substring>")?;
+            cmd_list(&backup_path, &live_path, needle)
         }
         _ => bail!(usage),
     }
@@ -261,6 +293,51 @@ fn cmd_findcallers(backup_path: &Path, live_path: &Path, target_findex: usize) -
     Ok(())
 }
 
+fn cmd_dump(backup_path: &Path, live_path: &Path, target_findex: usize) -> Result<()> {
+    // Diagnostic: full enhanced disassembly of one function (class/method name, regs, ops).
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+
+    let f = code
+        .functions
+        .iter()
+        .find(|f| f.findex.0 == target_findex)
+        .context("no function with that findex")?;
+    println!("{}", f.display::<hlbc::fmt::EnhancedFmt>(&code));
+    println!("--- raw ops ---");
+    for (i, op) in f.ops.iter().enumerate() {
+        println!("{i:>3}: {op:?}");
+    }
+    Ok(())
+}
+
+fn cmd_list(backup_path: &Path, live_path: &Path, needle: &str) -> Result<()> {
+    // Diagnostic: every function whose header (name, owning/arg types) or first debug
+    // source-file entry contains `needle`.
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+
+    let mut found = 0;
+    for f in &code.functions {
+        let header = f.display_header::<hlbc::fmt::EnhancedFmt>(&code).to_string();
+        let file_hit = f
+            .debug_info
+            .as_ref()
+            .and_then(|d| d.first())
+            .and_then(|(file, _)| code.debug_files.as_ref().and_then(|files| files.get(*file)))
+            .map(|s| s.to_string().contains(needle))
+            .unwrap_or(false);
+        if header.contains(needle) || file_hit {
+            println!("findex={} {}", f.findex.0, header);
+            found += 1;
+        }
+    }
+    println!("total matches: {found}");
+    Ok(())
+}
+
 fn cmd_status(live_path: &Path, backup_path: &Path) -> Result<()> {
     // Exit code is the machine-readable contract other tools (the Python client) rely on:
     // 0 = currently patched, 1 = not currently patched (apply needed), 2 = error (can't
@@ -314,6 +391,8 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     let non_linear_flag_path = config_dir.join(NON_LINEAR_FLAG_NAME).display().to_string();
 
     patch_get_battle_state(&mut code, &marker_prefix, &non_linear_flag_path)?;
+    patch_map_auto_refresh(&mut code)?;
+    patch_reveal_uses_real_state(&mut code)?;
 
     let out = File::create(live_path).context("failed to open hlboot.dat for writing")?;
     let mut writer = BufWriter::new(out);
@@ -464,5 +543,206 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
         ];
     }
     f.assigns = Some(Vec::new());
+    Ok(())
+}
+
+/// Register type of an existing, known-good function's register -- used to source correctly
+/// typed registers for brand-new code without needing to hand-construct type descriptors.
+fn reg_type(code: &Bytecode, findex: usize, reg: usize, what: &str) -> Result<RefType> {
+    code.functions
+        .iter()
+        .find(|f| f.findex.0 == findex)
+        .with_context(|| format!("could not find findex {findex} ({what}) -- Northgard build mismatch?"))?
+        .regs
+        .get(reg)
+        .copied()
+        .with_context(|| format!("findex {findex} has no reg{reg} ({what}) -- Northgard build mismatch?"))
+}
+
+/// Patches `ConquestMapContent.update(dt)` -- which already runs every frame while the
+/// Conquest map screen is open (it's what drives edge-of-screen panning) -- to also walk
+/// every node on the map and re-render it if its true state (marker-aware, via the
+/// already-patched `Conquest.getBattleState`) no longer matches what's cached in its
+/// `MapButton.battleState`. Without this, the map only ever evaluates node state once, at
+/// construction time -- newly-unlocked Chapters (or the reverse, a stale Locked node)
+/// don't visually update until the player backs out and back into the screen.
+///
+/// This is deliberately just *prepended* as a self-contained block before all of update()'s
+/// existing ops, rather than interleaved with them: every jump inside the original body is a
+/// *relative* offset, so inserting whole instructions uniformly before the entire body shifts
+/// every jump's source and target by the same amount and leaves every original offset valid,
+/// with zero need to touch (or risk miscalculating) any of the original function's own jumps.
+/// `MapButton.changeState` is itself a no-op if the state passed in matches what's already
+/// cached, so this doesn't need to duplicate that comparison -- it can call it unconditionally
+/// for every node, every frame.
+fn patch_map_auto_refresh(code: &mut Bytecode) -> Result<()> {
+    let conquest_ty = reg_type(code, HAS_NEXT_TO_UNLOCK_FINDEX, 3, "gamesys.conquest.Conquest")?;
+    let map_container_ty = reg_type(code, HAS_NEXT_TO_UNLOCK_FINDEX, 14, "ui.menus.conquest.MapContainer")?;
+    let battle_state_ty = reg_type(code, HAS_NEXT_TO_UNLOCK_FINDEX, 15, "enum<BattleState>")?;
+    let array_obj_ty = reg_type(code, GET_BUTTON_FINDEX, 4, "hl.types.ArrayObj")?;
+    let dynamic_ty = reg_type(code, GET_BUTTON_FINDEX, 8, "dynamic")?;
+    let raw_array_ty = reg_type(code, GET_BUTTON_FINDEX, 9, "array")?;
+    let map_button_ty = reg_type(code, GET_BUTTON_FINDEX, 11, "ui.menus.conquest.MapButton")?;
+    let battle_ty = reg_type(code, GET_BUTTON_BY_ID_FINDEX, 14, "gamesys.conquest.Battle")?;
+    let battle_data_ty = reg_type(code, GET_BUTTON_BY_ID_FINDEX, 13, "Battle.data virtual")?;
+    let string_ty = reg_type(code, GET_BUTTON_BY_ID_FINDEX, 1, "String")?;
+    let callback_ty = reg_type(code, CHANGE_STATE_FINDEX, 2, "() -> void callback")?;
+
+    let f = code
+        .functions
+        .iter_mut()
+        .find(|f| f.findex.0 == UPDATE_FINDEX)
+        .context("could not find ConquestMapContent.update -- Northgard build mismatch?")?;
+
+    let i32_ty = *f
+        .regs
+        .get(10)
+        .context("update()'s reg10 isn't present -- Northgard build mismatch?")?;
+    let void_reg = Reg(3); // update()'s own existing void-typed scratch register, reused throughout its body
+
+    let base = f.regs.len() as u32;
+    f.regs.push(conquest_ty); // base+0  rConquest
+    f.regs.push(map_container_ty); // base+1  rContainer
+    f.regs.push(array_obj_ty); // base+2  rColumns (outer: MapContainer.buttons)
+    f.regs.push(i32_ty); // base+3  rI (outer loop index)
+    f.regs.push(i32_ty); // base+4  rLen1
+    f.regs.push(array_obj_ty); // base+5  rColumn (inner array for this column)
+    f.regs.push(dynamic_ty); // base+6  rDyn (GetArray scratch, reused both levels)
+    f.regs.push(raw_array_ty); // base+7  rRaw1
+    f.regs.push(map_button_ty); // base+8  rButton
+    f.regs.push(i32_ty); // base+9  rJ (inner loop index)
+    f.regs.push(i32_ty); // base+10 rLen2
+    f.regs.push(raw_array_ty); // base+11 rRaw2
+    f.regs.push(battle_ty); // base+12 rBattle
+    f.regs.push(battle_data_ty); // base+13 rBattleData
+    f.regs.push(string_ty); // base+14 rInfId
+    f.regs.push(battle_state_ty); // base+15 rNewState
+    f.regs.push(callback_ty); // base+16 rNullCb
+
+    let r_conquest = Reg(base);
+    let r_container = Reg(base + 1);
+    let r_columns = Reg(base + 2);
+    let r_i = Reg(base + 3);
+    let r_len1 = Reg(base + 4);
+    let r_column = Reg(base + 5);
+    let r_dyn = Reg(base + 6);
+    let r_raw1 = Reg(base + 7);
+    let r_button = Reg(base + 8);
+    let r_j = Reg(base + 9);
+    let r_len2 = Reg(base + 10);
+    let r_raw2 = Reg(base + 11);
+    let r_battle = Reg(base + 12);
+    let r_battle_data = Reg(base + 13);
+    let r_infid = Reg(base + 14);
+    let r_new_state = Reg(base + 15);
+    let r_null_cb = Reg(base + 16);
+
+    let field_conquest = RefField(FIELD_CMC_CONQUEST);
+    let field_container = RefField(FIELD_CMC_CONTAINER);
+    let field_buttons = RefField(FIELD_MAPCONTAINER_BUTTONS);
+    let field_len = RefField(FIELD_ARRAYOBJ_LENGTH);
+    let field_arr = RefField(FIELD_ARRAYOBJ_ARRAY);
+    let field_button_data = RefField(FIELD_MAPBUTTON_DATA);
+    let field_battle_data = RefField(FIELD_BATTLE_DATA);
+    let field_infid = RefField(FIELD_BATTLEDATA_INFID);
+
+    use Opcode::*;
+    // Offsets are `target = source_index + 1 + offset` (confirmed against this same
+    // bytecode's own existing jumps, e.g. MapContainer.getButton). All targets below are
+    // local indices into this prelude alone -- OUTER_END (40) is exactly where the
+    // original function's ops get appended right after, unchanged.
+    let mut prelude = vec![
+        /*0*/ GetThis { dst: r_conquest, field: field_conquest },
+        /*1*/ GetThis { dst: r_container, field: field_container },
+        /*2*/ NullCheck { reg: r_container },
+        /*3*/ Field { dst: r_columns, obj: r_container, field: field_buttons },
+        /*4*/ Int { dst: r_i, ptr: RefInt(0) },
+        /*5*/ Label, // OUTER_LABEL
+        /*6*/ NullCheck { reg: r_columns },
+        /*7*/ Field { dst: r_len1, obj: r_columns, field: field_len },
+        /*8*/ JSGte { a: r_i, b: r_len1, offset: 31 }, // -> 40 (OUTER_END)
+        /*9*/ Field { dst: r_len1, obj: r_columns, field: field_len },
+        /*10*/ JULt { a: r_i, b: r_len1, offset: 2 }, // -> 13
+        /*11*/ Null { dst: r_column },
+        /*12*/ JAlways { offset: 3 }, // -> 16
+        /*13*/ Field { dst: r_raw1, obj: r_columns, field: field_arr },
+        /*14*/ GetArray { dst: r_dyn, array: r_raw1, index: r_i },
+        /*15*/ SafeCast { dst: r_column, src: r_dyn },
+        /*16*/ Incr { dst: r_i },
+        /*17*/ Int { dst: r_j, ptr: RefInt(0) },
+        /*18*/ Label, // INNER_LABEL
+        /*19*/ NullCheck { reg: r_column },
+        /*20*/ Field { dst: r_len2, obj: r_column, field: field_len },
+        /*21*/ JSGte { a: r_j, b: r_len2, offset: -17 }, // -> 5 (OUTER_LABEL)
+        /*22*/ Field { dst: r_len2, obj: r_column, field: field_len },
+        /*23*/ JULt { a: r_j, b: r_len2, offset: 2 }, // -> 26
+        /*24*/ Null { dst: r_button },
+        /*25*/ JAlways { offset: 3 }, // -> 29
+        /*26*/ Field { dst: r_raw2, obj: r_column, field: field_arr },
+        /*27*/ GetArray { dst: r_dyn, array: r_raw2, index: r_j },
+        /*28*/ UnsafeCast { dst: r_button, src: r_dyn },
+        /*29*/ Incr { dst: r_j },
+        /*30*/ NullCheck { reg: r_button },
+        /*31*/ Field { dst: r_battle, obj: r_button, field: field_button_data },
+        /*32*/ NullCheck { reg: r_battle },
+        /*33*/ Field { dst: r_battle_data, obj: r_battle, field: field_battle_data },
+        /*34*/ NullCheck { reg: r_battle_data },
+        /*35*/ Field { dst: r_infid, obj: r_battle_data, field: field_infid },
+        /*36*/ Call2 { dst: r_new_state, fun: RefFun(GATE_FINDEX), arg0: r_conquest, arg1: r_infid },
+        /*37*/ Null { dst: r_null_cb },
+        /*38*/ Call3 { dst: void_reg, fun: RefFun(CHANGE_STATE_FINDEX), arg0: r_button, arg1: r_new_state, arg2: r_null_cb },
+        /*39*/ JAlways { offset: -22 }, // -> 18 (INNER_LABEL)
+    ];
+    let prelude_len = prelude.len();
+    if prelude_len != 40 {
+        bail!("internal error: map-refresh prelude drifted from its expected 40 ops -- jump offsets above are no longer valid, fix before applying");
+    }
+
+    prelude.extend(f.ops.iter().cloned());
+    f.ops = prelude;
+
+    if let Some(debug_info) = &mut f.debug_info {
+        let first = debug_info.first().copied().unwrap_or((0, 0));
+        let mut new_debug = vec![first; prelude_len];
+        new_debug.extend(debug_info.iter().copied());
+        *debug_info = new_debug;
+    }
+    f.assigns = Some(Vec::new());
+
+    Ok(())
+}
+
+/// Fixes the post-battle "reveal" animation showing a not-actually-unlocked sibling node as
+/// selectable: `ConquestMapContent.animateNewBattlePlots` loops over every node in the newly
+/// reachable column and unconditionally sets each one's cached state to `Unlocked` (a
+/// hardcoded `GetGlobal` of the enum's `Unlocked` constructor) -- vanilla-correct when the
+/// only gate was adjacency (which just became true for the whole column), but wrong once
+/// Archipelago also requires a per-node item marker. At the point that hardcoded load sits,
+/// the loop already has the live `Conquest` instance (reg6) and this node's `infId` (reg4)
+/// in registers -- exactly `getBattleState`'s two arguments -- so this replaces that one
+/// opcode with a real call, in place, needing no new registers and no jump-offset changes.
+fn patch_reveal_uses_real_state(code: &mut Bytecode) -> Result<()> {
+    let f = code
+        .functions
+        .iter_mut()
+        .find(|f| f.findex.0 == ANIMATE_NEW_BATTLE_PLOTS_FINDEX)
+        .context("could not find ConquestMapContent.animateNewBattlePlots -- Northgard build mismatch?")?;
+
+    let op = f
+        .ops
+        .get_mut(ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP)
+        .context("animateNewBattlePlots is shorter than expected -- Northgard build mismatch?")?;
+    match op {
+        Opcode::GetGlobal { dst, global } if global.0 == GLOBAL_UNLOCKED => {
+            let dst = *dst;
+            *op = Opcode::Call2 { dst, fun: RefFun(GATE_FINDEX), arg0: Reg(6), arg1: Reg(4) };
+        }
+        other => bail!(
+            "animateNewBattlePlots op{ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP} doesn't \
+             match the expected hardcoded GetGlobal(Unlocked) (got {other:?}) -- Northgard build \
+             mismatch? Re-verify with `dump` before trusting this patch."
+        ),
+    }
+
     Ok(())
 }

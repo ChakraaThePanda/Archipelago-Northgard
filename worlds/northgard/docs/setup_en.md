@@ -39,5 +39,3 @@
   reverts it). It never reverts the patch itself: to play vanilla Northgard, just
   double-click the standalone `patch_northgard.exe` -- it finds your Northgard install
   automatically and gives you a menu to check status or restore to vanilla.
-
-See the root [README](../../../README.md#known-issues) for known issues.
