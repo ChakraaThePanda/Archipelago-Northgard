@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+tools/patch_northgard/target/
+
+# Release artifacts: built here for convenience so they can be attached to a GitHub
+# release, but they're generated/compiled output (from worlds/northgard/, Generate.py,
+# and tools/patch_northgard/ respectively), not source -- never commit them.
+/northgard.apworld
+/Northgard.yaml
+/patch_northgard.exe
+
+# Internal dev notes (bytecode findices, investigation writeup) -- kept locally for
+# future reference, deliberately not published.
+docs/DEVELOPMENT.md

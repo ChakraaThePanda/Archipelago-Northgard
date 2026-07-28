@@ -3,7 +3,7 @@ from typing import Any
 from BaseClasses import Region, ItemClassification, Tutorial
 from worlds.AutoWorld import World, WebWorld
 from worlds.generic.Rules import set_rule
-from worlds.LauncherComponents import Component, Type, components, launch_subprocess
+from worlds.LauncherComponents import Component, Type, components, launch_subprocess, icon_paths
 
 from .Items import item_table, NorthgardItem, CHAPTER_ITEMS, FILLER_ITEM_NAME, VICTORY_ITEM_NAME
 from .Locations import location_table, NorthgardLocation, VICTORY_LOCATION
@@ -26,7 +26,8 @@ def launch_client(*args) -> None:
         Main()
 
 
-components.append(Component("Northgard Client", func=launch_client, component_type=Type.CLIENT))
+icon_paths["northgard"] = f"ap:{__name__}/data/northgard_icon.png"
+components.append(Component("Northgard Client", func=launch_client, component_type=Type.CLIENT, icon="northgard"))
 
 
 class NorthgardWeb(WebWorld):
@@ -112,4 +113,6 @@ class NorthgardWorld(World):
     def fill_slot_data(self) -> dict[str, Any]:
         return {
             "amount_of_locations": self.options.amount_of_locations.value,
+            "non_linear_mode": self.options.progression_mode.value == self.options.progression_mode.option_non_linear,
+            "chapter7_requirement": self.options.chapter7_requirement.value,
         }
