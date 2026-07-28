@@ -1,0 +1,18 @@
+[package]
+name = "hlbc"
+version = "0.8.0"
+description = "Hashlink bytecode disassembler and analyzer"
+edition = "2021"
+
+[dependencies]
+byteorder = "1"
+flexstr = "0.9"
+fmtools = "0.1"
+hlbc-derive = { path = "../hlbc-derive" }
+memchr = "2"
+petgraph = { version = "0.6", default-features = false, features = ["graphmap"], optional = true }
+thiserror = "1"
+
+[features]
+default = []
+graph = ["petgraph"]

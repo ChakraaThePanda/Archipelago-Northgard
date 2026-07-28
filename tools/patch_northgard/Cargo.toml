@@ -1,0 +1,12 @@
+[package]
+name = "patch_northgard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+hlbc = { path = "vendor/hlbc", default-features = false }
+winreg = "0.52"
+
+[profile.release]
+opt-level = 1

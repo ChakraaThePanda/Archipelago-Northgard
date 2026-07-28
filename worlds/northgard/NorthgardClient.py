@@ -1,8 +1,17 @@
 """
 Archipelago client for Northgard. Watches a specific, user-pinned Conquest save for
 newly-completed Chapters and reports them as location checks; applies received
-Chapter-unlock items back (see NOTE in on_package below -- the enforcement side of this
-is not yet resolved).
+Chapter-unlock items back by writing marker files under
+"<Saved Games>\\Archipelago\\Northgard\\unlocked\\<infId>" (see _sync_unlock_markers and
+_write_unlock_marker below). Real in-game enforcement -- a node can't actually be selected
+in Conquest mode until its marker exists -- requires Northgard's own hlboot.dat to be
+patched with the corresponding Conquest.getBattleState change (see tools/patch_northgard
+in the source repo for how that patch itself works). This client bundles a prebuilt copy
+of that patcher and auto-heals the patch on every connect (see _ensure_game_patched) --
+if Northgard's files are already patched, or a Steam update silently reverted them, it's
+reapplied automatically with no user action needed. It deliberately never auto-restores to
+vanilla: that stays a manual, deliberate `patch_northgard.exe restore` so nothing here can
+silently revert your own choice to play unpatched Northgard.
 
 Ships inside the northgard.apworld package (like Manual's ManualClient.py) and is
 launched via the Archipelago Launcher's component registration in __init__.py -- it is
@@ -25,17 +34,27 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 
 import Utils
 from CommonClient import gui_enabled, logger, get_base_parser, CommonContext, ClientCommandProcessor, server_loop
 from NetUtils import ClientStatus
 
+from .Items import item_table as northgard_item_table
 from .Locations import location_table as northgard_location_table
-from .save_state import list_conquest_saves, read_conquest_run_state, CHAPTER_ROWS, ConquestSaveSummary
+from .Regions import FINAL_CHAPTER
+from .save_state import (
+    list_conquest_saves, read_conquest_run_state, infid_in_map, all_infids,
+    CHAPTER_ROWS, ConquestRunState, ConquestSaveSummary,
+)
 
 # All Chapter names in tree order, matching Regions.py.
 ALL_CHAPTERS: list[str] = [name for row in CHAPTER_ROWS for name in row]
+_ALL_CHAPTERS_SET: set[str] = set(ALL_CHAPTERS)
+
+# Reverse of Items.py's item_table -- ReceivedItems only gives us numeric item ids.
+_ID_TO_ITEM_NAME: dict[int, str] = {data.code: name for name, data in northgard_item_table.items()}
 
 # Resolved once at startup by _resolve_save_dir() (see main()) -- every install has this
 # somewhere different, so it's never safe to hardcode. Empty string means "not configured
@@ -96,6 +115,110 @@ _CONFIG_DIR = os.path.join(
     "Archipelago", "Northgard",
 )
 _CONFIG_FILE = os.path.join(_CONFIG_DIR, "client_config.json")
+
+# Read by the patched Northgard game binary itself (Conquest.getBattleState) -- one empty
+# marker file per unlocked battle id, named exactly that save's map[row][col]['infId'].
+# This directory is NOT scoped per-room/per-save: the patch only knows how to check a fixed
+# path, so running two rooms/saves at once whose randomized infId pools happen to collide
+# could cross-unlock. Acceptable for now; revisit if that turns out to matter in practice.
+_UNLOCK_DIR = os.path.join(_CONFIG_DIR, "unlocked")
+
+# Also read by the patched game binary -- its mere existence (contents don't matter) tells
+# Conquest.getBattleState to skip its own column-adjacency check and gate purely on the
+# per-node marker above, i.e. Non-Linear Mode. Deliberately NOT inside _UNLOCK_DIR: that
+# folder's cleanup logic (_cleanup_stale_markers) assumes every file in it is an infId
+# marker for some save's map, which this isn't.
+_NON_LINEAR_FLAG_PATH = os.path.join(_CONFIG_DIR, "non_linear_mode.flag")
+
+
+def _set_non_linear_mode(enabled: bool) -> None:
+    if enabled:
+        os.makedirs(_CONFIG_DIR, exist_ok=True)
+        if not os.path.exists(_NON_LINEAR_FLAG_PATH):
+            open(_NON_LINEAR_FLAG_PATH, "w", encoding="utf-8").close()
+    else:
+        try:
+            os.remove(_NON_LINEAR_FLAG_PATH)
+        except OSError:
+            pass
+
+
+_PATCH_EXE_NAME = "patch_northgard.exe"
+
+
+def _extract_patch_exe() -> str | None:
+    """Copies the prebuilt patcher this apworld bundles out to a real file on disk and
+    returns its path, or None if it can't be found (e.g. a source checkout that hasn't
+    built it). Extraction is needed even when it's already sitting on disk somewhere --
+    the apworld itself may be loaded directly from a zip, where nothing can execute an
+    exe in-place. Re-extracting every time is deliberate and cheap (a few hundred KB);
+    it avoids having to detect whether a previously-extracted copy is stale."""
+    try:
+        import importlib.resources
+        data = importlib.resources.files(__package__).joinpath(_PATCH_EXE_NAME).read_bytes()
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return None
+    os.makedirs(_CONFIG_DIR, exist_ok=True)
+    extracted_path = os.path.join(_CONFIG_DIR, _PATCH_EXE_NAME)
+    with open(extracted_path, "wb") as f:
+        f.write(data)
+    return extracted_path
+
+
+def _ensure_game_patched() -> None:
+    """Auto-heals the in-game lock enforcement patch on every connect (see module
+    docstring): checks patch_northgard.exe's own status, and reapplies only if it reports
+    "not currently patched" (covers both "never applied" and "a Steam update reverted
+    it"). Never calls `restore` -- that direction is only ever manual, so nothing here can
+    override a deliberate choice to play vanilla Northgard."""
+    if not NORTHGARD_SAVE_DIR:
+        return
+    install_dir = os.path.dirname(NORTHGARD_SAVE_DIR.rstrip("\\/"))
+    exe_path = _extract_patch_exe()
+    if exe_path is None:
+        return
+    try:
+        status = subprocess.run([exe_path, "status", install_dir], capture_output=True, timeout=15)
+        if status.returncode == 0:
+            return  # already patched -- nothing to do
+        result = subprocess.run([exe_path, "apply", install_dir], capture_output=True, timeout=15)
+        if result.returncode == 0:
+            logger.info("[Northgard] In-game lock enforcement patch applied.")
+        else:
+            logger.warning(
+                f"[Northgard] Could not apply the in-game lock enforcement patch: "
+                f"{result.stderr.decode(errors='replace').strip()}"
+            )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.warning(f"[Northgard] Could not check/apply the in-game lock enforcement patch: {e}")
+
+
+def _write_unlock_marker(infid: str) -> None:
+    os.makedirs(_UNLOCK_DIR, exist_ok=True)
+    marker_path = os.path.join(_UNLOCK_DIR, infid)
+    if not os.path.exists(marker_path):
+        open(marker_path, "w", encoding="utf-8").close()
+
+
+def _cleanup_stale_markers(old_save_path: str | None, new_save_path: str | None) -> None:
+    """Northgard reshuffles the same pool of battle-scenario names across different
+    Conquest runs, so a marker file's name (an infId) isn't unique to one save forever --
+    if we stop tracking a save (finished it, or re-pinned to a different one), its markers
+    have to go, or a later save that happens to draw the same infId would start out
+    falsely unlocked. Scoped to exactly the old save's own map, so a concurrent second
+    room/save's markers are never touched."""
+    if old_save_path is None or old_save_path == new_save_path:
+        return
+    try:
+        stale_infids = all_infids(old_save_path)
+    except (OSError, KeyError, ValueError):
+        return
+    for infid in stale_infids:
+        try:
+            os.remove(os.path.join(_UNLOCK_DIR, infid))
+        except OSError:
+            pass
+
 
 # One-time migration from the old pre-"Saved Games" location, so upgrading doesn't lose an
 # already-detected save_dir or accumulated per-room pins.
@@ -324,8 +447,10 @@ class NorthgardCommandProcessor(ClientCommandProcessor):
                 logger.info(f"[Northgard] '{choice}' isn't a valid choice -- run /conquest with no argument to see the list")
                 return False
             chosen = saves[int(choice)]
+            _cleanup_stale_markers(ctx.pinned_save_path, chosen.path)
             ctx.pinned_save_path = chosen.path
             ctx.sent_chapters.clear()
+            ctx.written_markers.clear()  # not received_chapters -- that's the slot's item history, unaffected by which local save we're pointed at
             _save_pin(room_key, chosen.filename)
             logger.info(
                 f"[Northgard] Pinned to {chosen.filename} ({_clan_description(chosen.clan, chosen.partner_clan)}, "
@@ -354,8 +479,20 @@ class NorthgardContext(CommonContext):
         self.finished_game: bool = False
         self.pinned_save_path: str | None = None
         self._known_room_key: str | None = None  # room_key we last resolved a pin for
+        self.received_chapters: set[str] = set()  # Chapter-item names received this room
+        self.written_markers: set[str] = set()  # Chapter-item names already marked unlocked on disk
+        self.non_linear_mode: bool = False
+        self.chapter7_requirement: int = 0  # Non-Linear Mode only -- see _sync_unlock_markers
+        # _apply_room_pin fires on the very first "RoomInfo" packet, before the server's own
+        # "Connected"/"X has joined" chat lines -- logging immediately there means the pin
+        # status gets buried above all of that. Instead it's stashed here and printed on
+        # save_watcher's first poll tick, comfortably after the connection noise has settled.
+        self._pending_pin_message: str | None = None
 
-        logger.info("[Northgard] Waiting to connect before resolving this room's pinned save (pins are per-room).")
+    def make_gui(self):
+        ui = super().make_gui()
+        ui.base_title = "Archipelago Northgard Client"
+        return ui
 
     def _apply_room_pin(self) -> None:
         """Called once we know this connection's room_key (see RoomInfo handling below).
@@ -368,17 +505,22 @@ class NorthgardContext(CommonContext):
         if room_key is None or room_key == self._known_room_key:
             return
         self._known_room_key = room_key
+        old_save_path = self.pinned_save_path
         self.sent_chapters.clear()
+        self.received_chapters.clear()
+        self.written_markers.clear()
 
         pinned_filename = _load_pins().get(room_key)
         if not pinned_filename:
             self.pinned_save_path = None
-            logger.info(f"[Northgard] No conquest save pinned yet for this room ({room_key}) -- use /conquest to pick one.")
+            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
+            self._pending_pin_message = f"[Northgard] No conquest save pinned yet for this room ({room_key}) -- use /conquest to pick one."
             return
 
         if not NORTHGARD_SAVE_DIR:
             self.pinned_save_path = None
-            logger.info(
+            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
+            self._pending_pin_message = (
                 f"[Northgard] This room is pinned to {pinned_filename!r}, but no save folder is configured "
                 f"yet -- run /savedir, then /conquest to re-pick it."
             )
@@ -387,13 +529,15 @@ class NorthgardContext(CommonContext):
         match = next((s for s in list_conquest_saves(NORTHGARD_SAVE_DIR) if s.filename == pinned_filename), None)
         if match is not None:
             self.pinned_save_path = match.path
-            logger.info(
+            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
+            self._pending_pin_message = (
                 f"[Northgard] Resuming this room's pinned save: {match.filename} "
                 f"({_clan_description(match.clan, match.partner_clan)}). Use /conquest to change it."
             )
         else:
             self.pinned_save_path = None
-            logger.info(
+            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
+            self._pending_pin_message = (
                 f"[Northgard] This room was previously pinned to {pinned_filename!r}, but that save "
                 f"is no longer found. Use /conquest to pick one."
             )
@@ -409,15 +553,27 @@ class NorthgardContext(CommonContext):
             self.seed_name = args.get("seed_name")
             self._apply_room_pin()
         elif cmd == "Connected":
-            self.amount_of_locations = args.get("slot_data", {}).get("amount_of_locations", 4)
+            slot_data = args.get("slot_data", {})
+            self.amount_of_locations = slot_data.get("amount_of_locations", 4)
+            self.non_linear_mode = bool(slot_data.get("non_linear_mode", False))
+            self.chapter7_requirement = slot_data.get("chapter7_requirement", 0)
+            _set_non_linear_mode(self.non_linear_mode)
+            _ensure_game_patched()
         elif cmd == "ReceivedItems":
-            # NOTE: this is where a received "Chapter N [- Top/Bottom]" item should be
-            # applied back to Northgard so that node becomes selectable in-game. Not yet
-            # implemented -- see project notes on why this needs confirming against how
-            # the Conquest node-select screen actually decides what's choosable before
-            # writing anything here. Deliberately silent otherwise: the tree is
-            # permissive/simple enough that this doesn't need per-item console noise.
-            pass
+            # Applies a received "Chapter N [- Top/Bottom]" item back to Northgard so that
+            # node becomes actually selectable in-game (enforced by the patched game binary
+            # itself -- see Conquest.getBattleState's marker-file check). ReceivedItems may
+            # be a full resend from index 0 on every reconnect; received_chapters is a set,
+            # so re-processing the same item is harmless. The actual marker files can't be
+            # written yet without knowing which save this room is pinned to (need that
+            # save's own map to translate a Chapter name into the real in-game battle id it
+            # randomized for this run) -- see _sync_unlock_markers, polled from save_watcher.
+            for entry in args.get("items", []):
+                # entry is a NetUtils.NetworkItem (a NamedTuple), not a plain dict --
+                # attribute access, not .get().
+                name = _ID_TO_ITEM_NAME.get(entry.item)
+                if name in _ALL_CHAPTERS_SET:
+                    self.received_chapters.add(name)
 
     def location_ids_for_chapter(self, chapter_name: str) -> list[int]:
         ids = []
@@ -429,20 +585,55 @@ class NorthgardContext(CommonContext):
         return ids
 
 
+def _sync_unlock_markers(ctx: NorthgardContext, state: ConquestRunState) -> None:
+    """Writes one marker file per received-but-not-yet-written Chapter item, resolving
+    each Chapter name to this specific save's randomized in-game battle id first. Takes an
+    already-decoded ConquestRunState (see save_watcher) rather than re-reading the save
+    itself -- this and the check-sending logic both need it every poll tick, so it's read
+    once and shared rather than decoding the save file twice (or once per pending Chapter).
+
+    Non-Linear Mode drops the game's own adjacency requirement entirely (see the patched
+    Conquest.getBattleState), so without this, receiving Chapter 07's item alone would let
+    you jump straight to the final battle. When chapter7_requirement is set, Chapter 07's
+    own marker is withheld until at least that many *other* Chapters are actually completed
+    in this save -- everything else unlocks immediately on item receipt as normal. Ignored
+    in Linear Mode, where Chapter 07's place at the end of the tree already requires
+    completing its ancestors."""
+    pending = ctx.received_chapters - ctx.written_markers
+    if not pending:
+        return
+    completed_count = len(state.completed_chapters)
+
+    for chapter_name in pending:
+        if (
+            chapter_name == FINAL_CHAPTER
+            and ctx.non_linear_mode
+            and ctx.chapter7_requirement > 0
+            and completed_count < ctx.chapter7_requirement
+        ):
+            continue  # requirement not met yet -- leave pending, retry next poll
+        try:
+            infid = infid_in_map(state.map_rows, chapter_name, state.save_path)
+        except (KeyError, ValueError):
+            continue  # map shape unexpected this tick -- retry next poll
+        _write_unlock_marker(infid)
+        ctx.written_markers.add(chapter_name)
+
+
 async def save_watcher(ctx: NorthgardContext):
-    # No "waiting for a pinned save" nag here: before connecting, there's no room to pin
-    # against yet (see _room_key), so any such message would be telling you to run
-    # /conquest before that's actually possible. _apply_room_pin already logs the correct,
-    # room-aware version of this ("no save pinned for this room -- use /conquest") right
-    # when a connection's RoomInfo arrives.
     while not ctx.exit_event.is_set():
         try:
+            if ctx._pending_pin_message is not None:
+                logger.info(ctx._pending_pin_message)
+                ctx._pending_pin_message = None
+
             if ctx.pinned_save_path is None:
                 pass
             elif not os.path.exists(ctx.pinned_save_path):
                 logger.warning(f"[Northgard] Pinned save no longer found: {ctx.pinned_save_path}. Run /conquest again.")
             else:
                 state = read_conquest_run_state(ctx.pinned_save_path)
+                _sync_unlock_markers(ctx, state)
 
                 new_chapters = [c for c in state.completed_chapters if c not in ctx.sent_chapters]
                 if new_chapters:
@@ -488,6 +679,13 @@ def launch() -> None:
     cli_args = sys.argv[1:]
     if "Northgard Client" in cli_args:
         cli_args.remove("Northgard Client")
+    # The Launcher's "Component -- args" invocation inserts a literal "--" separator
+    # ahead of any component args (e.g. `ArchipelagoLauncher.exe "Northgard Client" --
+    # --nogui host:port`) -- left in place, argparse treats everything after it as
+    # forced-positional-only, which silently swallows real flags like --nogui instead of
+    # recognizing them. Strip it, same as "Northgard Client" above.
+    if "--" in cli_args:
+        cli_args.remove("--")
     parsed_args, _ = parser.parse_known_args(args=cli_args)
 
     colorama.init()

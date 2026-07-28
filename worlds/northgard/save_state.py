@@ -40,6 +40,9 @@ class ConquestRunState:
     clan: str
     partner_clan: str | None  # Conquest is co-op against the AI, not PvP -- None for a solo run
     completed_chapters: list[str]  # in tree order, e.g. ["Chapter 01", "Chapter 02 - Bottom", ...]
+    map_rows: list[list[str]]  # this save's own randomized infId grid -- see load_conquest_map.
+    # Kept here (rather than re-decoding the save) so a single read_conquest_run_state call
+    # per poll tick can serve both check-sending and infid_in_map lookups.
 
 
 @dataclass
@@ -91,6 +94,53 @@ def _row_node_names(map_grid: list) -> list[list[str]]:
     return rows
 
 
+def all_infids(save_file: str) -> set[str]:
+    """Every battle id this specific save's map randomized, across every tree position --
+    used to scope marker-file cleanup to exactly one save when a room gets re-pinned to a
+    different one, without touching a concurrent second room/save's own markers."""
+    with open(save_file, "r", encoding="utf-8") as f:
+        obj = decode(f.read())
+    return {name for row in _row_node_names(obj["map"]) for name in row}
+
+
+def load_conquest_map(save_file: str) -> list[list[str]]:
+    """Decodes the save once and returns its row-major infId grid -- use this +
+    infid_in_map when resolving several Chapter names against the same save in one go
+    (e.g. once per poll tick), to avoid re-decoding the file for each one."""
+    with open(save_file, "r", encoding="utf-8") as f:
+        obj = decode(f.read())
+    return _row_node_names(obj["map"])
+
+
+def infid_in_map(map_rows: list[list[str]], chapter_name: str, save_file: str = "<given map>") -> str:
+    """Resolves a Chapter name to its battle id within an already-decoded map_rows (see
+    load_conquest_map) -- no file I/O. save_file is only used to make error messages
+    identify which save's map was being checked."""
+    for depth, chapter_names in enumerate(CHAPTER_ROWS):
+        if chapter_name not in chapter_names:
+            continue
+        col = chapter_names.index(chapter_name)
+        if depth >= len(map_rows) or col >= len(map_rows[depth]):
+            raise ValueError(
+                f"Conquest map in {save_file!r} doesn't have a cell at row {depth} col {col} "
+                f"for {chapter_name!r} -- map shape may have changed."
+            )
+        return map_rows[depth][col]
+
+    raise ValueError(f"{chapter_name!r} is not a recognized Chapter name")
+
+
+def infid_for_chapter(save_file: str, chapter_name: str) -> str:
+    """The actual in-game battle id (map[row][col]['infId']) occupying a given Chapter's
+    tree position in this specific save -- Northgard randomizes which named battle scenario
+    sits at each position per-save (see 'seed' on each map cell), so this can never be a
+    fixed table; it always has to be resolved against the save currently in play.
+
+    One-shot convenience wrapper around load_conquest_map + infid_in_map -- prefer those
+    directly when resolving more than one Chapter name against the same save."""
+    return infid_in_map(load_conquest_map(save_file), chapter_name, save_file)
+
+
 def read_conquest_run_state(save_file: str) -> ConquestRunState:
     with open(save_file, "r", encoding="utf-8") as f:
         text = f.read()
@@ -106,15 +156,19 @@ def read_conquest_run_state(save_file: str) -> ConquestRunState:
             f"do not assume path-index mapping is still valid until this is re-checked."
         )
 
+    # Matched by content (which row/col this infId actually belongs to), not by position
+    # in path -- path[i] is NOT guaranteed to be tree row i. In Non-Linear Mode a player can
+    # win both the Top and Bottom battle of the same row (nothing stops them once both show
+    # Unlocked), which appends two entries for what's structurally one row; a positional
+    # depth->row assumption would then misalign every row after that one.
     completed: list[str] = []
-    for depth, inf_id in enumerate(path):
-        row_names = map_rows[depth]
-        chapter_names = CHAPTER_ROWS[depth]
-        if inf_id not in row_names:
-            raise ValueError(
-                f"path[{depth}]={inf_id!r} not found in map row {depth} ({row_names!r}) of {save_file!r}"
-            )
-        completed.append(chapter_names[row_names.index(inf_id)])
+    for inf_id in path:
+        for row_names, chapter_names in zip(map_rows, CHAPTER_ROWS):
+            if inf_id in row_names:
+                completed.append(chapter_names[row_names.index(inf_id)])
+                break
+        else:
+            raise ValueError(f"path entry {inf_id!r} not found in any map row of {save_file!r}")
 
     players = obj.get("players", [])
     clan = players[0]["clan"] if players else obj.get("clan", "?")
@@ -125,4 +179,5 @@ def read_conquest_run_state(save_file: str) -> ConquestRunState:
         clan=clan,
         partner_clan=partner,
         completed_chapters=completed,
+        map_rows=map_rows,
     )
