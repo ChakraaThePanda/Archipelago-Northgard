@@ -10,5 +10,6 @@ tools/patch_northgard/target/
 /patch_northgard.exe
 
 # Internal dev notes (bytecode findices, investigation writeup) -- kept locally for
-# future reference, deliberately not published.
-docs/DEVELOPMENT.md
+# future reference, deliberately not published. Player-facing docs live under
+# worlds/northgard/docs/ instead, which ships inside the apworld and isn't ignored.
+/docs/
