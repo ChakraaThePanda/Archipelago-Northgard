@@ -1,4 +1,4 @@
-# Archipelago Northgard
+# Archipelago-Northgard
 
 An [Archipelago](https://archipelago.gg) randomizer for **Northgard**, played in **Conquest
 mode**. 
