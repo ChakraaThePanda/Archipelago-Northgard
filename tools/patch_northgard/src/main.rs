@@ -368,12 +368,64 @@ fn cmd_restore(live_path: &Path, backup_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Writes `data` to `path` via write-to-temp-then-rename in the same directory (so the
+/// rename is an atomic same-volume replace) instead of truncating `path` in place. Two
+/// uncoordinated `apply` runs racing against the same install dir -- e.g. two Launcher
+/// client windows connected to two different rooms, both auto-healing the same real
+/// Northgard install (see NorthgardClient.py's module docstring, which explicitly treats
+/// that as supported) -- can otherwise truncate-and-rewrite the live file concurrently and
+/// leave it torn. With this, whichever racer's rename lands last simply wins outright: the
+/// destination always ends up as one complete, non-torn write, never an interleaved mess.
+///
+/// Deliberately does NOT sweep old leftover temp files: if this process is killed between
+/// the write and the rename, a stray `.<name>.tmp_<pid>_<nanos>` file is left behind
+/// harmlessly (the target it would have replaced is simply untouched, never corrupted).
+/// Aggressively cleaning those up needs its own age check to avoid deleting another
+/// concurrent apply's temp file out from under it before its rename runs -- more moving
+/// parts to buy back a purely cosmetic leftover file. Not worth it: leave it for a human to
+/// notice and delete if it ever bothers them.
+fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path.parent().context("target path has no parent directory")?;
+    let file_name = path.file_name().context("target path has no file name")?.to_string_lossy();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = dir.join(format!(".{file_name}.tmp_{}_{nanos}", std::process::id()));
+
+    let write_result = (|| -> Result<()> {
+        let file = File::create(&tmp_path).context("failed to create temp file for atomic write")?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(data)?;
+        writer.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, path).context("failed to atomically replace target file") {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     if !live_path.exists() {
         bail!("No hlboot.dat found at {}", live_path.display());
     }
     if !backup_path.exists() {
-        fs::copy(live_path, backup_path).context("failed to create pristine backup before patching")?;
+        // Atomic write-then-rename here too: two racing first-time `apply` calls both see
+        // "no backup yet" and both copy `live_path` -- if that ever raced against the OTHER
+        // one's patched write already landing on live_path, a plain fs::copy could capture a
+        // torn read. Reading fully into memory first, then writing the backup atomically,
+        // means the backup is always either the untouched-but-fully-valid original bytes or
+        // (in the very unlikely case the other racer's rename already won) a complete,
+        // non-torn copy of the now-patched file -- never a partial read either way.
+        let pristine = fs::read(live_path).context("failed to read hlboot.dat to create pristine backup")?;
+        write_atomically(backup_path, &pristine).context("failed to create pristine backup before patching")?;
         println!("Backed up pristine hlboot.dat to {}", backup_path.display());
     }
 
@@ -394,9 +446,9 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     patch_map_auto_refresh(&mut code)?;
     patch_reveal_uses_real_state(&mut code)?;
 
-    let out = File::create(live_path).context("failed to open hlboot.dat for writing")?;
-    let mut writer = BufWriter::new(out);
-    code.serialize(&mut writer).context("failed to write patched bytecode")?;
+    let mut serialized = Vec::new();
+    code.serialize(&mut serialized).context("failed to serialize patched bytecode")?;
+    write_atomically(live_path, &serialized).context("failed to write patched hlboot.dat")?;
 
     println!("Patched hlboot.dat installed at {}", live_path.display());
     println!("Marker directory: {unlock_dir_display}", unlock_dir_display = unlock_dir.display());
@@ -745,4 +797,102 @@ fn patch_reveal_uses_real_state(code: &mut Bytecode) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_atomically;
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "patch_northgard_test_{name}_{}_{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_atomically_basic_roundtrip() {
+        let dir = unique_test_dir("basic");
+        let target = dir.join("hlboot.dat");
+        write_atomically(&target, b"hello world").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"hello world");
+
+        // overwriting an existing target must also work (this is the common case: apply
+        // replacing an already-patched live file)
+        write_atomically(&target, b"a different, longer payload").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"a different, longer payload");
+
+        // no leftover temp file
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp_"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp file(s): {leftovers:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The actual concern this whole change exists for: two Launcher/client windows both
+    /// auto-healing the same real hlboot.dat at once, fully uncoordinated on the Python
+    /// side. Simulates that with many threads racing write_atomically against the SAME
+    /// destination path, each with a distinct, easily-identifiable full payload, repeated
+    /// over many rounds to make sure the destination is never a torn/mixed file -- always
+    /// exactly one full writer's content, whichever rename won.
+    #[test]
+    fn write_atomically_concurrent_never_tears() {
+        let dir = unique_test_dir("concurrent");
+        let target = dir.join("hlboot.dat");
+        let target = Arc::new(target);
+
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 25;
+        const PAYLOAD_LEN: usize = 200_000; // big enough that a naive truncate+buffered-write race would very likely interleave
+
+        for round in 0..ROUNDS {
+            let mut handles = Vec::new();
+            for t in 0..THREADS {
+                let target = Arc::clone(&target);
+                // distinctive, self-describing payload: every byte is this thread+round's
+                // own marker byte, so any interleaving from two different writers would
+                // show up as mixed byte values instead of one uniform value throughout.
+                let marker = (round * THREADS + t) as u8;
+                let payload = vec![marker; PAYLOAD_LEN];
+                handles.push(thread::spawn(move || {
+                    write_atomically(&target, &payload).expect("write_atomically failed under concurrency");
+                    marker
+                }));
+            }
+            let markers: Vec<u8> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            let final_bytes = fs::read(&*target).expect("destination missing after concurrent writes");
+            assert_eq!(final_bytes.len(), PAYLOAD_LEN, "round {round}: final file size doesn't match any single writer's payload -- looks torn");
+            let final_marker = final_bytes[0];
+            assert!(
+                final_bytes.iter().all(|&b| b == final_marker),
+                "round {round}: final file contains mixed bytes -- torn/interleaved write, not an atomic replace"
+            );
+            assert!(
+                markers.contains(&final_marker),
+                "round {round}: final content (marker {final_marker}) doesn't match any of this round's writers {markers:?}"
+            );
+
+            let leftovers: Vec<_> = fs::read_dir(&*dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp_"))
+                .collect();
+            assert!(leftovers.is_empty(), "round {round}: leftover temp file(s) after all writers finished: {leftovers:?}");
+        }
+
+        let _ = fs::remove_dir_all(&*dir);
+    }
 }
