@@ -31,11 +31,14 @@ they won't stomp on each other. See _room_key / _apply_room_pin below.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
+import time
 
 import Utils
 from CommonClient import gui_enabled, logger, get_base_parser, CommonContext, ClientCommandProcessor, server_loop
@@ -144,6 +147,44 @@ def _set_non_linear_mode(enabled: bool) -> None:
 
 
 _PATCH_EXE_NAME = "patch_northgard.exe"
+_PATCH_EXE_TEMP_PREFIX = "patch_northgard_"
+_STALE_PATCH_EXE_AGE_SECONDS = 86400  # a full day -- generous on purpose, see the prune function below
+
+_patch_check_lock = threading.Lock()
+_extracted_exe_path: str | None = None  # cached for this process's life -- see _extract_patch_exe
+
+
+def _prune_other_leftover_patch_exe_copies() -> None:
+    """Best-effort hygiene sweep, NOT a correctness guard: this process's own extracted
+    copy is named after its own pid (see _extract_patch_exe), so it can never collide with
+    another process's copy in the first place -- nothing here needs to protect against
+    that. This only clears out copies left behind by a crashed/killed prior process so they
+    don't accumulate forever in the player's Saved Games folder. Deliberately generous (a
+    full day): there's no safety reason to be aggressive, so it's not worth the added
+    complexity of checking whether a given pid is still alive -- a copy belonging to a
+    process that's still running is simply skipped (open for execution -> delete fails
+    silently), same as one that's merely too recent to sweep yet."""
+    try:
+        entries = os.listdir(_CONFIG_DIR)
+    except OSError:
+        return
+    now = time.time()
+    for name in entries:
+        if name.startswith(_PATCH_EXE_TEMP_PREFIX) and name.endswith(".exe"):
+            path = os.path.join(_CONFIG_DIR, name)
+            try:
+                if now - os.path.getmtime(path) < _STALE_PATCH_EXE_AGE_SECONDS:
+                    continue  # too recent to safely assume abandoned
+                os.remove(path)
+            except OSError:
+                pass  # still in use (by this process's own copy, or another instance's) -- fine, skip it
+
+
+def _cleanup_own_patch_exe(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _extract_patch_exe() -> str | None:
@@ -151,17 +192,34 @@ def _extract_patch_exe() -> str | None:
     returns its path, or None if it can't be found (e.g. a source checkout that hasn't
     built it). Extraction is needed even when it's already sitting on disk somewhere --
     the apworld itself may be loaded directly from a zip, where nothing can execute an
-    exe in-place. Re-extracting every time is deliberate and cheap (a few hundred KB);
-    it avoids having to detect whether a previously-extracted copy is stale."""
+    exe in-place.
+
+    Cached for the rest of this process's life: the bundled bytes can't change while this
+    process is running (the apworld is loaded once, not hot-reloaded), so there's nothing
+    to gain from re-extracting on every connect. Named after this process's own pid, so it
+    can never collide with another process's copy even with two Launcher/client windows
+    open against the same install at once (see module docstring) -- no locking or
+    heuristics needed for that, it's true by construction. Cleaned up once via atexit
+    rather than after every use, since the whole point is to reuse it.
+
+    Only ever called from inside _ensure_game_patched, which holds _patch_check_lock for
+    its entire body -- that's what actually serializes access to the cache below. If a
+    second call site is ever added, it needs its own guard around this cache."""
+    global _extracted_exe_path
+    if _extracted_exe_path is not None and os.path.exists(_extracted_exe_path):
+        return _extracted_exe_path
     try:
         import importlib.resources
         data = importlib.resources.files(__package__).joinpath(_PATCH_EXE_NAME).read_bytes()
     except (FileNotFoundError, ModuleNotFoundError, OSError):
         return None
     os.makedirs(_CONFIG_DIR, exist_ok=True)
-    extracted_path = os.path.join(_CONFIG_DIR, _PATCH_EXE_NAME)
+    _prune_other_leftover_patch_exe_copies()
+    extracted_path = os.path.join(_CONFIG_DIR, f"{_PATCH_EXE_TEMP_PREFIX}{os.getpid()}.exe")
     with open(extracted_path, "wb") as f:
         f.write(data)
+    atexit.register(_cleanup_own_patch_exe, extracted_path)
+    _extracted_exe_path = extracted_path
     return extracted_path
 
 
@@ -170,27 +228,51 @@ def _ensure_game_patched() -> None:
     docstring): checks patch_northgard.exe's own status, and reapplies only if it reports
     "not currently patched" (covers both "never applied" and "a Steam update reverted
     it"). Never calls `restore` -- that direction is only ever manual, so nothing here can
-    override a deliberate choice to play vanilla Northgard."""
+    override a deliberate choice to play vanilla Northgard.
+
+    Runs blocking subprocess calls (up to ~30s combined) -- always invoke this off the
+    asyncio event loop thread (see its call site in on_package) so a slow or hung patch
+    check can't freeze the rest of the client.
+
+    Guarded by _patch_check_lock so at most one status/apply pair runs at a time in this
+    process: since this is spawned on its own thread per connect, a reconnect firing
+    "Connected" again while a previous check is still in flight would otherwise let a
+    second status/apply pair run concurrently with the first. If a check is already
+    running, this just skips; the in-flight one will reach the same conclusion regardless
+    of what triggered it.
+
+    This lock is process-local only -- it does NOT prevent two separate processes (e.g.
+    two Launcher/client windows open against the same install) from both running `apply`
+    at once. That's fine: the actual hazard there was two concurrent applies corrupting the
+    real hlboot.dat, and that's fixed at the root in tools/patch_northgard/src/main.rs's
+    cmd_apply, which writes via write-to-temp-then-atomic-rename instead of truncating the
+    live file in place -- so even fully uncoordinated concurrent applies can't produce a
+    torn file; whichever one's rename lands last simply wins outright."""
     if not NORTHGARD_SAVE_DIR:
         return
-    install_dir = os.path.dirname(NORTHGARD_SAVE_DIR.rstrip("\\/"))
-    exe_path = _extract_patch_exe()
-    if exe_path is None:
+    if not _patch_check_lock.acquire(blocking=False):
         return
     try:
-        status = subprocess.run([exe_path, "status", install_dir], capture_output=True, timeout=15)
-        if status.returncode == 0:
-            return  # already patched -- nothing to do
-        result = subprocess.run([exe_path, "apply", install_dir], capture_output=True, timeout=15)
-        if result.returncode == 0:
-            logger.info("[Northgard] In-game lock enforcement patch applied.")
-        else:
-            logger.warning(
-                f"[Northgard] Could not apply the in-game lock enforcement patch: "
-                f"{result.stderr.decode(errors='replace').strip()}"
-            )
-    except (OSError, subprocess.SubprocessError) as e:
-        logger.warning(f"[Northgard] Could not check/apply the in-game lock enforcement patch: {e}")
+        install_dir = os.path.dirname(NORTHGARD_SAVE_DIR.rstrip("\\/"))
+        exe_path = _extract_patch_exe()
+        if exe_path is None:
+            return
+        try:
+            status = subprocess.run([exe_path, "status", install_dir], capture_output=True, timeout=15)
+            if status.returncode == 0:
+                return  # already patched -- nothing to do
+            result = subprocess.run([exe_path, "apply", install_dir], capture_output=True, timeout=15)
+            if result.returncode == 0:
+                logger.info("[Northgard] In-game lock enforcement patch applied.")
+            else:
+                logger.warning(
+                    f"[Northgard] Could not apply the in-game lock enforcement patch: "
+                    f"{result.stderr.decode(errors='replace').strip()}"
+                )
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning(f"[Northgard] Could not check/apply the in-game lock enforcement patch: {e}")
+    finally:
+        _patch_check_lock.release()
 
 
 def _write_unlock_marker(infid: str) -> None:
@@ -558,7 +640,13 @@ class NorthgardContext(CommonContext):
             self.non_linear_mode = bool(slot_data.get("non_linear_mode", False))
             self.chapter7_requirement = slot_data.get("chapter7_requirement", 0)
             _set_non_linear_mode(self.non_linear_mode)
-            _ensure_game_patched()
+            # Runs the (up to ~30s) patch check/apply off the event loop thread so
+            # connecting doesn't freeze the client -- see _ensure_game_patched's docstring.
+            # The lock check here is just an optimization to skip spawning a thread that
+            # would immediately no-op on a reconnect burst; _ensure_game_patched's own
+            # non-blocking acquire is what actually guarantees mutual exclusion.
+            if not _patch_check_lock.locked():
+                threading.Thread(target=_ensure_game_patched, daemon=True).start()
         elif cmd == "ReceivedItems":
             # Applies a received "Chapter N [- Top/Bottom]" item back to Northgard so that
             # node becomes actually selectable in-game (enforced by the patched game binary
