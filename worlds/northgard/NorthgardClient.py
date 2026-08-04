@@ -121,9 +121,18 @@ _CONFIG_FILE = os.path.join(_CONFIG_DIR, "client_config.json")
 
 # Read by the patched Northgard game binary itself (Conquest.getBattleState) -- one empty
 # marker file per unlocked battle id, named exactly that save's map[row][col]['infId'].
-# This directory is NOT scoped per-room/per-save: the patch only knows how to check a fixed
-# path, so running two rooms/saves at once whose randomized infId pools happen to collide
-# could cross-unlock. Acceptable for now; revisit if that turns out to matter in practice.
+# The directory itself is a single flat namespace keyed only by infId -- the patched game
+# binary can only check a fixed path, it has no concept of "room" or "save" -- so this
+# can't be scoped per-room/per-save at the filesystem level the way pins are. Instead
+# _sync_unlock_markers reconciles it every poll tick against whichever save is actually
+# pinned right now, using the same room<->save tracking /conquest already keeps in
+# client_config.json's "pins": any marker for an infId that's part of the pinned save's
+# own map but wasn't actually earned in this room gets deleted, closing the case where
+# Northgard reuses a battle name across runs and an old room/save's leftover marker would
+# otherwise falsely unlock an unrelated node in a new one. Markers for infIds that aren't
+# part of the currently pinned save at all are left alone -- they may belong to a
+# different room/save pinned in a concurrent second client window, which this client has
+# no way to distinguish from genuine staleness.
 _UNLOCK_DIR = os.path.join(_CONFIG_DIR, "unlocked")
 
 # Also read by the patched game binary -- its mere existence (contents don't matter) tells
@@ -280,6 +289,13 @@ def _write_unlock_marker(infid: str) -> None:
     marker_path = os.path.join(_UNLOCK_DIR, infid)
     if not os.path.exists(marker_path):
         open(marker_path, "w", encoding="utf-8").close()
+
+
+def _remove_unlock_marker(infid: str) -> None:
+    try:
+        os.remove(os.path.join(_UNLOCK_DIR, infid))
+    except OSError:
+        pass  # already gone (or never existed) -- fine either way
 
 
 def _cleanup_stale_markers(old_save_path: str | None, new_save_path: str | None) -> None:
@@ -674,11 +690,32 @@ class NorthgardContext(CommonContext):
 
 
 def _sync_unlock_markers(ctx: NorthgardContext, state: ConquestRunState) -> None:
-    """Writes one marker file per received-but-not-yet-written Chapter item, resolving
-    each Chapter name to this specific save's randomized in-game battle id first. Takes an
-    already-decoded ConquestRunState (see save_watcher) rather than re-reading the save
-    itself -- this and the check-sending logic both need it every poll tick, so it's read
-    once and shared rather than decoding the save file twice (or once per pending Chapter).
+    """Keeps _UNLOCK_DIR in sync with exactly what *this room's pinned save* should show as
+    unlocked -- in both directions. Writes one marker per received-but-not-yet-written
+    Chapter item (resolving each Chapter name to this save's randomized battle id first),
+    same as before. NEW: also removes any existing marker whose infId belongs to this
+    save's own map but isn't currently earned in this room.
+
+    That removal half is what actually scopes _UNLOCK_DIR per room/seed in practice, the
+    same way /conquest already scopes *which save* belongs to which room (see
+    client_config.json's "pins", and _room_key/_apply_room_pin): _UNLOCK_DIR itself is a
+    single flat namespace keyed only by infId (the patched game binary can only check a
+    fixed path -- see its module comment), and Northgard reuses the same pool of battle
+    names across different Conquest runs. Without this, a marker left behind by some
+    earlier room/save (e.g. one _cleanup_stale_markers couldn't clean up because that old
+    save file no longer exists) can falsely unlock an unrelated node in a brand-new save
+    that happens to draw the same infId. Runs every poll tick (see save_watcher), so
+    whichever save is actually pinned right now always self-heals back to correct within
+    one poll interval, regardless of how the flat directory got out of sync.
+
+    Deliberately leaves alone any marker whose infId ISN'T part of this save's own map --
+    those may legitimately belong to a different room/save pinned in a concurrent second
+    client window (see the module docstring), and this client has no way to tell.
+
+    Takes an already-decoded ConquestRunState (see save_watcher) rather than re-reading
+    the save itself -- this and the check-sending logic both need it every poll tick, so
+    it's read once and shared rather than decoding the save file twice (or once per
+    pending Chapter).
 
     Non-Linear Mode drops the game's own adjacency requirement entirely (see the patched
     Conquest.getBattleState), so without this, receiving Chapter 07's item alone would let
@@ -687,25 +724,37 @@ def _sync_unlock_markers(ctx: NorthgardContext, state: ConquestRunState) -> None
     in this save -- everything else unlocks immediately on item receipt as normal. Ignored
     in Linear Mode, where Chapter 07's place at the end of the tree already requires
     completing its ancestors."""
-    pending = ctx.received_chapters - ctx.written_markers
-    if not pending:
-        return
     completed_count = len(state.completed_chapters)
+    wanted_infids: set[str] = set()
 
-    for chapter_name in pending:
+    for chapter_name in ctx.received_chapters:
         if (
             chapter_name == FINAL_CHAPTER
             and ctx.non_linear_mode
             and ctx.chapter7_requirement > 0
             and completed_count < ctx.chapter7_requirement
         ):
-            continue  # requirement not met yet -- leave pending, retry next poll
+            continue  # requirement not met yet -- stays un-marked (purged below if stale)
         try:
             infid = infid_in_map(state.map_rows, chapter_name, state.save_path)
         except (KeyError, ValueError):
             continue  # map shape unexpected this tick -- retry next poll
-        _write_unlock_marker(infid)
-        ctx.written_markers.add(chapter_name)
+        wanted_infids.add(infid)
+        if chapter_name not in ctx.written_markers:
+            _write_unlock_marker(infid)
+            ctx.written_markers.add(chapter_name)
+
+    # Belt-and-suspenders: keep genuinely-completed nodes' markers too, even though
+    # getBattleState already returns Done for these before it ever looks at the marker.
+    for chapter_name in state.completed_chapters:
+        try:
+            wanted_infids.add(infid_in_map(state.map_rows, chapter_name, state.save_path))
+        except (KeyError, ValueError):
+            pass
+
+    this_save_infids = {infid for row in state.map_rows for infid in row}
+    for stray_infid in this_save_infids - wanted_infids:
+        _remove_unlock_marker(stray_infid)
 
 
 async def save_watcher(ctx: NorthgardContext):
