@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 
 import Utils
 from CommonClient import gui_enabled, logger, get_base_parser, CommonContext, ClientCommandProcessor, server_loop
@@ -467,9 +468,6 @@ def _clan_description(clan: str, partner_clan: str | None) -> str:
 def _format_age(mtime: float) -> str:
     """Short, human-readable 'when was this last written', precise enough to tell apart
     saves created moments apart (seconds/minutes), but not fussy about older ones."""
-    import time
-    from datetime import datetime
-
     delta = time.time() - mtime
     dt = datetime.fromtimestamp(mtime)
     if delta < 120:
@@ -782,7 +780,7 @@ async def save_watcher(ctx: NorthgardContext):
                     if location_ids:
                         await ctx.send_msgs([{"cmd": "LocationChecks", "locations": location_ids}])
 
-                    if not ctx.finished_game and "Chapter 07" in ctx.sent_chapters:
+                    if not ctx.finished_game and FINAL_CHAPTER in ctx.sent_chapters:
                         ctx.finished_game = True
                         await ctx.send_msgs([{"cmd": "StatusUpdate", "status": ClientStatus.CLIENT_GOAL}])
         except Exception:
