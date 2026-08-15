@@ -40,7 +40,7 @@ class ConquestRunState:
     clan: str
     partner_clan: str | None  # Conquest is co-op against the AI, not PvP -- None for a solo run
     completed_chapters: list[str]  # in tree order, e.g. ["Chapter 01", "Chapter 02 - Bottom", ...]
-    map_rows: list[list[str]]  # this save's own randomized infId grid -- see load_conquest_map.
+    map_rows: list[list[str]]  # this save's own randomized infId grid -- see infid_in_map.
     # Kept here (rather than re-decoding the save) so a single read_conquest_run_state call
     # per poll tick can serve both check-sending and infid_in_map lookups.
 
@@ -103,18 +103,9 @@ def all_infids(save_file: str) -> set[str]:
     return {name for row in _row_node_names(obj["map"]) for name in row}
 
 
-def load_conquest_map(save_file: str) -> list[list[str]]:
-    """Decodes the save once and returns its row-major infId grid -- use this +
-    infid_in_map when resolving several Chapter names against the same save in one go
-    (e.g. once per poll tick), to avoid re-decoding the file for each one."""
-    with open(save_file, "r", encoding="utf-8") as f:
-        obj = decode(f.read())
-    return _row_node_names(obj["map"])
-
-
 def infid_in_map(map_rows: list[list[str]], chapter_name: str, save_file: str = "<given map>") -> str:
     """Resolves a Chapter name to its battle id within an already-decoded map_rows (see
-    load_conquest_map) -- no file I/O. save_file is only used to make error messages
+    read_conquest_run_state) -- no file I/O. save_file is only used to make error messages
     identify which save's map was being checked."""
     for depth, chapter_names in enumerate(CHAPTER_ROWS):
         if chapter_name not in chapter_names:
@@ -128,17 +119,6 @@ def infid_in_map(map_rows: list[list[str]], chapter_name: str, save_file: str = 
         return map_rows[depth][col]
 
     raise ValueError(f"{chapter_name!r} is not a recognized Chapter name")
-
-
-def infid_for_chapter(save_file: str, chapter_name: str) -> str:
-    """The actual in-game battle id (map[row][col]['infId']) occupying a given Chapter's
-    tree position in this specific save -- Northgard randomizes which named battle scenario
-    sits at each position per-save (see 'seed' on each map cell), so this can never be a
-    fixed table; it always has to be resolved against the save currently in play.
-
-    One-shot convenience wrapper around load_conquest_map + infid_in_map -- prefer those
-    directly when resolving more than one Chapter name against the same save."""
-    return infid_in_map(load_conquest_map(save_file), chapter_name, save_file)
 
 
 def read_conquest_run_state(save_file: str) -> ConquestRunState:
