@@ -50,6 +50,14 @@ const ANIMATE_NEW_BATTLE_PLOTS_FINDEX: usize = 28476;
 const ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP: usize = 46;
 const GLOBAL_UNLOCKED: usize = 6241;
 
+// Path-dedup-by-column fix (see patch_path_dedup_by_column below): Conquest.onBattleCompleted
+// only appends a won battle's id to the save's `path` ledger if no sibling in the same tree
+// row already has an entry there -- a no-op guard in vanilla Linear Mode (only one sibling per
+// row is ever winnable) but one that silently drops the SECOND sibling's win once Non-Linear
+// Mode lets both be won.
+const BATTLE_COMPLETED_FINDEX: usize = 8762; // Conquest.onBattleCompleted
+const BATTLE_COMPLETED_SKIP_PATH_PUSH_OP: usize = 55; // JTrue(isColumnInPath(colIndex), +7) -- skips the path.push() below it
+
 const FIELD_CMC_CONQUEST: usize = 19; // ConquestMapContent.conquest
 const FIELD_CMC_CONTAINER: usize = 13; // ConquestMapContent.container
 const FIELD_MAPCONTAINER_BUTTONS: usize = 79; // MapContainer.buttons (nested column/row array of MapButton)
@@ -445,6 +453,7 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     patch_get_battle_state(&mut code, &marker_prefix, &non_linear_flag_path)?;
     patch_map_auto_refresh(&mut code)?;
     patch_reveal_uses_real_state(&mut code)?;
+    patch_path_dedup_by_column(&mut code)?;
 
     let mut serialized = Vec::new();
     code.serialize(&mut serialized).context("failed to serialize patched bytecode")?;
@@ -796,6 +805,48 @@ fn patch_reveal_uses_real_state(code: &mut Bytecode) -> Result<()> {
         ),
     }
 
+    Ok(())
+}
+
+/// Fixes Northgard's own `Conquest.onBattleCompleted` silently dropping a battle win from the
+/// save's `path` ledger -- the sole source of truth `NorthgardClient.py`/`save_state.py` use
+/// to know a Chapter is done -- whenever another node in the same tree row/column already has
+/// an entry there. Vanilla Northgard only ever lets you win ONE of a row's two sibling
+/// battles (winning either one locks out the other), so this guard is a no-op there in
+/// practice; Non-Linear Mode (this project's own `non_linear_mode.flag`, see
+/// patch_get_battle_state) is what first makes BOTH siblings winnable, which is exactly when
+/// this pre-existing bug surfaces: the second sibling won in a row never lands in `path` even
+/// though the game shows it as won, regardless of how it was won -- confirmed on a real save
+/// where winning "MuspellWrath" then "KeepSimple" (same tree row) left `path` with
+/// MuspellWrath but not KeepSimple, while `finishedBattleId` (a separate field, unaffected by
+/// this bug) correctly named KeepSimple as the most recently finished battle.
+///
+/// The fix replaces the single conditional jump (`JTrue` on `isColumnInPath(colIndex)`) that
+/// skips the `path.push(id)` call with an unconditional fallthrough (`JAlways{offset: 0}`,
+/// i.e. never skip) -- one opcode, no new registers, no other jump offsets affected. The
+/// `isColumnInPath` call itself is left in place (now simply unused) rather than removed, to
+/// avoid touching anything else in the function's register/jump layout.
+fn patch_path_dedup_by_column(code: &mut Bytecode) -> Result<()> {
+    let f = code
+        .functions
+        .iter_mut()
+        .find(|f| f.findex.0 == BATTLE_COMPLETED_FINDEX)
+        .context("could not find Conquest.onBattleCompleted -- Northgard build mismatch?")?;
+
+    let op = f
+        .ops
+        .get_mut(BATTLE_COMPLETED_SKIP_PATH_PUSH_OP)
+        .context("onBattleCompleted is shorter than expected -- Northgard build mismatch?")?;
+    match op {
+        Opcode::JTrue { offset, .. } if *offset == 7 => {
+            *op = Opcode::JAlways { offset: 0 };
+        }
+        other => bail!(
+            "onBattleCompleted op{BATTLE_COMPLETED_SKIP_PATH_PUSH_OP} doesn't match the \
+             expected JTrue(isColumnInPath, +7) (got {other:?}) -- Northgard build mismatch? \
+             Re-verify with `dump` before trusting this patch."
+        ),
+    }
     Ok(())
 }
 
