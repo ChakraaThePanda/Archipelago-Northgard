@@ -127,7 +127,21 @@ def read_conquest_run_state(save_file: str) -> ConquestRunState:
     obj = decode(text)
 
     map_rows = _row_node_names(obj["map"])
-    path: list[str] = obj["path"]
+    path: list[str] = list(obj["path"])
+
+    # Northgard's own Conquest.onBattleCompleted only appends a won battle's id to `path`
+    # if no OTHER node in the same tree row already has an entry there -- a no-op guard in
+    # vanilla Linear Mode (only one sibling per row is ever winnable) but one that silently
+    # drops the SECOND sibling's win once Non-Linear Mode lets both be won, regardless of how
+    # that second battle was won. `finishedBattleId` records the most recently finished
+    # battle independently of that bug (the game only clears it once its own UI has consumed
+    # it), so treat it as an authoritative addition to `path` whenever it names a battle not
+    # already recorded there -- this self-heals the gap for already-affected saves with no
+    # manual editing needed. patch_northgard's `onBattleCompleted` patch fixes the root cause
+    # going forward; this covers saves that hit the bug before that patch was applied.
+    finished_id = obj.get("finishedBattleId")
+    if finished_id and finished_id not in path:
+        path.append(finished_id)
 
     if len(map_rows) != len(CHAPTER_ROWS):
         raise ValueError(
