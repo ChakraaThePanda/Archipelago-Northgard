@@ -75,10 +75,22 @@ class NorthgardWorld(World):
 
         menu.connect(regions[STARTING_CHAPTER])
 
-        for chapter, targets in CHAPTER_CONNECTIONS.items():
-            for target in targets:
-                entrance = regions[chapter].connect(regions[target])
-                set_rule(entrance, lambda state, item=target: state.has(item, self.player))
+        non_linear = self.options.progression_mode.value == self.options.progression_mode.option_non_linear
+        if non_linear:
+            # Non-Linear Mode: the patched client drops the adjacency requirement entirely
+            # (see NorthgardClient._sync_unlock_markers), so the region graph must match --
+            # every Chapter hangs directly off Menu, gated only by its own item, instead of
+            # requiring its ancestors' regions to be reached first.
+            for chapter in CHAPTERS:
+                if chapter == STARTING_CHAPTER:
+                    continue
+                entrance = menu.connect(regions[chapter], f"Menu -> {chapter} (non-linear)")
+                set_rule(entrance, lambda state, item=chapter: state.has(item, self.player))
+        else:
+            for chapter, targets in CHAPTER_CONNECTIONS.items():
+                for target in targets:
+                    entrance = regions[chapter].connect(regions[target])
+                    set_rule(entrance, lambda state, item=target: state.has(item, self.player))
 
         amount = self.options.amount_of_locations.value
         for chapter in CHAPTERS:
