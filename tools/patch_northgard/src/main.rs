@@ -58,6 +58,22 @@ const GLOBAL_UNLOCKED: usize = 6241;
 const BATTLE_COMPLETED_FINDEX: usize = 8762; // Conquest.onBattleCompleted
 const BATTLE_COMPLETED_SKIP_PATH_PUSH_OP: usize = 55; // JTrue(isColumnInPath(colIndex), +7) -- skips the path.push() below it
 
+// animateLastPath-invokes-callback-on-null-lastButtonIndex fix (see
+// patch_animate_last_path_invokes_callback_when_skipped below): `animateLastPath(container,
+// onDone)` early-returns via `JNull(this.lastButtonIndex) -> Ret` whenever `lastButtonIndex` is
+// null -- WITHOUT ever invoking `onDone`. The Conquest map's post-battle-completion handling
+// passes exactly the callback that eventually calls `consumeFinishedBattleId` + `unlockUI` as
+// this `onDone` -- so when this early-return path is taken, that callback is silently dropped
+// and the Conquest map never unlocks, permanently: no node selectable, Escape included.
+// `lastButtonIndex` is null on a freshly-opened map before the player has clicked anything,
+// which is exactly when this reveal flow auto-triggers off a stale `finishedBattleId` from a
+// battle completed out of vanilla's assumed order (only possible in Non-Linear Mode) -- so this
+// path is hit precisely in that scenario, never in vanilla, since vanilla can never have a
+// pending finishedBattleId before lastButtonIndex is first set by a real click. Confirmed as the
+// actual root cause via direct instrumentation on a real repro, not static analysis alone.
+const ANIMATE_LAST_PATH_FINDEX: usize = 28475; // ConquestMapContent.animateLastPath(dt, onDone)
+const ANIMATE_LAST_PATH_NULL_JUMP_OP: usize = 1; // JNull(lastButtonIndex) -> Ret, dropping onDone entirely
+
 const FIELD_CMC_CONQUEST: usize = 19; // ConquestMapContent.conquest
 const FIELD_CMC_CONTAINER: usize = 13; // ConquestMapContent.container
 const FIELD_MAPCONTAINER_BUTTONS: usize = 79; // MapContainer.buttons (nested column/row array of MapButton)
@@ -454,6 +470,7 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     patch_map_auto_refresh(&mut code)?;
     patch_reveal_uses_real_state(&mut code)?;
     patch_path_dedup_by_column(&mut code)?;
+    patch_animate_last_path_invokes_callback_when_skipped(&mut code)?;
 
     let mut serialized = Vec::new();
     code.serialize(&mut serialized).context("failed to serialize patched bytecode")?;
@@ -847,6 +864,65 @@ fn patch_path_dedup_by_column(code: &mut Bytecode) -> Result<()> {
              Re-verify with `dump` before trusting this patch."
         ),
     }
+    Ok(())
+}
+
+/// Fixes the actual root cause of the Conquest map permanently locking (no node selectable,
+/// Escape included) after a battle completed out of vanilla's assumed column order: confirmed
+/// via direct instrumentation, not static analysis alone. `animateLastPath` drops its `onDone`
+/// callback entirely when `this.lastButtonIndex` is null, jumping straight to `Ret` instead of
+/// ever invoking it. That callback is what eventually calls `unlockUI` -- so when this path is
+/// taken, the Conquest map never unlocks. The fix appends two new ops after the function's
+/// existing body (`CallClosure(onDone)` then `Ret`) and retargets the existing `JNull` to land
+/// there instead of the original `Ret` -- the callback still runs even though `buildPath`'s own
+/// animation is skipped, so the "unlock everything once this finishes" contract is preserved
+/// either way.
+fn patch_animate_last_path_invokes_callback_when_skipped(code: &mut Bytecode) -> Result<()> {
+    let f = code
+        .functions
+        .iter_mut()
+        .find(|f| f.findex.0 == ANIMATE_LAST_PATH_FINDEX)
+        .context("could not find ConquestMapContent.animateLastPath -- Northgard build mismatch?")?;
+
+    if f.ops.len() != 19 {
+        bail!(
+            "animateLastPath's shape doesn't match what this patch was designed against \
+             (expected 19 ops, got {}) -- Northgard was likely updated; re-verify with hlbc \
+             before trusting this tool.",
+            f.ops.len()
+        );
+    }
+
+    use Opcode::*;
+    let void_reg = Reg(2); // this function's own existing void-typed scratch register
+    let r_callback = Reg(1); // the onDone: () -> void parameter
+
+    let op = f
+        .ops
+        .get_mut(ANIMATE_LAST_PATH_NULL_JUMP_OP)
+        .context("animateLastPath is shorter than expected -- Northgard build mismatch?")?;
+    match op {
+        Opcode::JNull { reg, offset } if *offset == 16 => {
+            let reg = *reg;
+            *op = Opcode::JNull { reg, offset: 17 }; // -> 19 (new CallClosure below), instead of -> 18 (Ret)
+        }
+        other => bail!(
+            "animateLastPath op{ANIMATE_LAST_PATH_NULL_JUMP_OP} doesn't match the expected \
+             JNull(lastButtonIndex, +16) (got {other:?}) -- Northgard build mismatch? Re-verify \
+             with `dump` before trusting this patch."
+        ),
+    }
+
+    f.ops.push(CallClosure { dst: void_reg, fun: r_callback, args: vec![] });
+    f.ops.push(Ret { ret: void_reg });
+
+    if let Some(debug_info) = &mut f.debug_info {
+        let last = debug_info.last().copied().unwrap_or((0, 0));
+        debug_info.push(last);
+        debug_info.push(last);
+    }
+    f.assigns = Some(Vec::new());
+
     Ok(())
 }
 
