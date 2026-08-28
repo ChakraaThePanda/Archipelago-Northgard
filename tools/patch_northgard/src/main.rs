@@ -30,32 +30,24 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-const GATE_FINDEX: usize = 8760; // Conquest.getBattleState
-const STRING_ADD_FINDEX: usize = 21; // String.__add__
-const GET_PATH_FINDEX: usize = 16543; // sys.FileSystem's path-normalizing helper
-const SYS_EXISTS_FINDEX: usize = 16542; // native sys_exists
-
-// Live-refresh patch (see patch_map_auto_refresh below): every frame, re-check and
-// re-render every node on the open Conquest map instead of only at construction time.
-const UPDATE_FINDEX: usize = 28486; // ConquestMapContent.update(dt)
-const CHANGE_STATE_FINDEX: usize = 28498; // MapButton.changeState(state, onDone)
-const HAS_NEXT_TO_UNLOCK_FINDEX: usize = 28481; // ConquestMapContent.hasNextToUnlock -- source of the Conquest/MapContainer/enum<BattleState> reg types and the `conquest`/`container` field indices, all on the same class as `update`
-const GET_BUTTON_FINDEX: usize = 28512; // MapContainer.getButton -- source of the ArrayObj/dynamic/array/MapButton reg types and the `buttons` field index
-const GET_BUTTON_BY_ID_FINDEX: usize = 28513; // MapContainer.getButtonById -- source of the Battle/virtual/String reg types and the `data`/`infId` field indices
-
-// Post-battle "reveal" animation fix: ConquestMapContent.animateNewBattlePlots hardcodes
-// every next-column node to Unlocked (global(6241)) regardless of whether it's actually
-// allowed -- see patch_reveal_uses_real_state below.
-const ANIMATE_NEW_BATTLE_PLOTS_FINDEX: usize = 28476;
+// NOTE: findices themselves are no longer hardcoded here -- see find_method_findex /
+// find_native_findex below. Northgard renumbers its whole function table on every
+// recompile (confirmed: this is exactly what silently broke Chapter-lock enforcement
+// after an Aug 2026 game update -- GATE_FINDEX pointed at an unrelated function post-update,
+// and `apply`'s own shape check should have caught it, but the stale `status` check never
+// even tried to reapply). Class/method names are tied to the game's own source and don't
+// move around under a recompile the way compiler-assigned indices do, so every lookup below
+// resolves by name at `apply` time instead. What's still true even after a shape-preserving
+// rename, though harder to fix generically, are the FIELD_*/GLOBAL_* constants and hardcoded
+// op-index positions further down (e.g. ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP) --
+// those remain numeric and would need the same treatment if a future update moves *them*.
 const ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP: usize = 46;
-const GLOBAL_UNLOCKED: usize = 6241;
 
 // Path-dedup-by-column fix (see patch_path_dedup_by_column below): Conquest.onBattleCompleted
 // only appends a won battle's id to the save's `path` ledger if no sibling in the same tree
 // row already has an entry there -- a no-op guard in vanilla Linear Mode (only one sibling per
 // row is ever winnable) but one that silently drops the SECOND sibling's win once Non-Linear
 // Mode lets both be won.
-const BATTLE_COMPLETED_FINDEX: usize = 8762; // Conquest.onBattleCompleted
 const BATTLE_COMPLETED_SKIP_PATH_PUSH_OP: usize = 55; // JTrue(isColumnInPath(colIndex), +7) -- skips the path.push() below it
 
 // animateLastPath-invokes-callback-on-null-lastButtonIndex fix (see
@@ -71,7 +63,6 @@ const BATTLE_COMPLETED_SKIP_PATH_PUSH_OP: usize = 55; // JTrue(isColumnInPath(co
 // path is hit precisely in that scenario, never in vanilla, since vanilla can never have a
 // pending finishedBattleId before lastButtonIndex is first set by a real click. Confirmed as the
 // actual root cause via direct instrumentation on a real repro, not static analysis alone.
-const ANIMATE_LAST_PATH_FINDEX: usize = 28475; // ConquestMapContent.animateLastPath(dt, onDone)
 const ANIMATE_LAST_PATH_NULL_JUMP_OP: usize = 1; // JNull(lastButtonIndex) -> Ret, dropping onDone entirely
 
 const FIELD_CMC_CONQUEST: usize = 19; // ConquestMapContent.conquest
@@ -85,6 +76,51 @@ const FIELD_BATTLEDATA_INFID: usize = 1; // virtual{infId, ...}.infId
 
 const UNLOCK_SUBDIR: &str = "unlocked";
 const NON_LINEAR_FLAG_NAME: &str = "non_linear_mode.flag";
+
+/// Finds a class method's current findex by name instead of a hardcoded number.
+/// Northgard renumbers its whole function table on every recompile, but a method's
+/// (owning class, method name) pair is tied to the game's own Haxe source and stays put
+/// across updates the same way a Python function's qualified name would. Call once per
+/// `apply` run; each patch_* function still runs its own shape check (op/reg counts)
+/// afterwards as defense in depth, since a same-named method's *body* can still change
+/// shape across an update even when its identity doesn't.
+fn find_method_findex(code: &Bytecode, class_name: &str, method_name: &str) -> Result<usize> {
+    let matches: Vec<usize> = code
+        .functions
+        .iter()
+        .filter(|f| f.name(code) == method_name)
+        .filter(|f| {
+            f.parent
+                .and_then(|p| p.as_obj(code))
+                .map(|obj| obj.name(code) == class_name)
+                .unwrap_or(false)
+        })
+        .map(|f| f.findex.0)
+        .collect();
+
+    match matches.as_slice() {
+        [one] => Ok(*one),
+        [] => bail!(
+            "could not find {class_name}.{method_name} by name -- Northgard build mismatch? \
+             Re-verify with `patch_northgard list <dir> {method_name}` before trusting this patch."
+        ),
+        many => bail!(
+            "{class_name}.{method_name} is ambiguous -- {} candidate findices found: {many:?} \
+             -- Northgard build mismatch?",
+            many.len()
+        ),
+    }
+}
+
+/// Same idea as find_method_findex, for native (non-Haxe) functions like `sys_exists`,
+/// which live in their own table keyed by (lib, name) rather than belonging to a class.
+fn find_native_findex(code: &Bytecode, lib: &str, name: &str) -> Result<usize> {
+    code.natives
+        .iter()
+        .find(|n| n.lib(code) == lib && n.name(code) == name)
+        .map(|n| n.findex.0)
+        .with_context(|| format!("could not find native {lib}.{name} -- Northgard build mismatch?"))
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -107,7 +143,7 @@ fn main() -> Result<()> {
     let backup_path = install_dir.join("hlboot.dat.orig_backup");
 
     match args[1].as_str() {
-        "status" => cmd_status(&live_path, &backup_path),
+        "status" => cmd_status(&live_path),
         "restore" => cmd_restore(&live_path, &backup_path),
         "apply" => cmd_apply(&live_path, &backup_path),
         "findcallers" => {
@@ -122,6 +158,11 @@ fn main() -> Result<()> {
             let needle = args.get(3).context("usage: patch_northgard list <dir> <source-file-substring>")?;
             cmd_list(&backup_path, &live_path, needle)
         }
+        "whois" => {
+            let findex: usize = args.get(3).context("usage: patch_northgard whois <dir> <findex>")?.parse()?;
+            cmd_whois(&backup_path, &live_path, findex)
+        }
+        "natives" => cmd_natives(&backup_path, &live_path),
         _ => bail!(usage),
     }
 }
@@ -139,17 +180,16 @@ fn pause_before_exit() {
     read_line();
 }
 
-fn print_status_line(live_path: &Path, backup_path: &Path) {
+fn print_status_line(live_path: &Path) {
     if !live_path.exists() {
         println!("Status: no hlboot.dat found here -- is this really the Northgard install folder?");
-    } else if !backup_path.exists() {
-        println!("Status: NOT patched (no backup present yet)");
-    } else {
-        match (fs::read(live_path), fs::read(backup_path)) {
-            (Ok(live), Ok(backup)) if live == backup => println!("Status: NOT patched (matches the pristine backup)"),
-            (Ok(_), Ok(_)) => println!("Status: PATCHED (Chapter locks are enforced in-game)"),
-            _ => println!("Status: unknown (couldn't read one of the files)"),
-        }
+        return;
+    }
+    match check_battle_state_patched(live_path) {
+        Ok(PatchState::Vanilla) => println!("Status: NOT patched (getBattleState is vanilla)"),
+        Ok(PatchState::Patched) => println!("Status: PATCHED (Chapter locks are enforced in-game)"),
+        Ok(PatchState::Unknown(reason)) => println!("Status: unknown ({reason})"),
+        Err(e) => println!("Status: unknown (couldn't parse hlboot.dat: {e})"),
     }
 }
 
@@ -259,7 +299,7 @@ fn run_interactive() -> Result<()> {
     loop {
         println!();
         println!("Northgard install: {}", install_dir.display());
-        print_status_line(&live_path, &backup_path);
+        print_status_line(&live_path);
         println!();
         println!("[1] Apply/re-apply the patch (enforce Chapter locks in-game)");
         println!("[2] Restore to vanilla (undo the patch)");
@@ -362,7 +402,83 @@ fn cmd_list(backup_path: &Path, live_path: &Path, needle: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(live_path: &Path, backup_path: &Path) -> Result<()> {
+fn cmd_whois(backup_path: &Path, live_path: &Path, target_findex: usize) -> Result<()> {
+    // Diagnostic: what class (if any) owns this findex by name, for verifying
+    // find_method_findex's inputs against a real build. Read-only.
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+
+    let f = code
+        .functions
+        .iter()
+        .find(|f| f.findex.0 == target_findex)
+        .context("no function with that findex")?;
+    let class = f
+        .parent
+        .and_then(|p| p.as_obj(&code))
+        .map(|obj| obj.name(&code).to_string());
+    println!(
+        "findex={} name={:?} parent_class={:?}",
+        target_findex,
+        f.name(&code).to_string(),
+        class
+    );
+    Ok(())
+}
+
+fn cmd_natives(backup_path: &Path, live_path: &Path) -> Result<()> {
+    // Diagnostic: every native (lib.name@findex), for verifying find_native_findex's inputs.
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+
+    for n in &code.natives {
+        println!("{}.{}@{}", n.lib(&code), n.name(&code), n.findex.0);
+    }
+    println!("total natives: {}", code.natives.len());
+    Ok(())
+}
+
+/// Whether the *actual enforcement logic* is present in a live hlboot.dat right now.
+/// Deliberately does NOT diff live bytes against the pristine backup: a legitimate
+/// Northgard game update changes those bytes too (new vanilla build != old vanilla
+/// backup), which reads as "patched" under a pure byte-diff even though nothing of ours
+/// is in there -- confirmed as the actual root cause of Chapter-lock enforcement going
+/// silently, permanently absent after an Aug 2026 Northgard update: the stale byte-diff
+/// check told the auto-healing client "already patched," so it never even tried to
+/// reapply. Checking getBattleState's own op count instead answers the question that
+/// actually matters (is the marker check really in there), and keeps answering it
+/// correctly across a future update as long as find_method_findex can still locate the
+/// function by name.
+enum PatchState {
+    Vanilla,
+    Patched,
+    Unknown(String),
+}
+
+fn check_battle_state_patched(live_path: &Path) -> Result<PatchState> {
+    let path_str = live_path.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+    let gate_findex = match find_method_findex(&code, "gamesys.conquest.Conquest", "getBattleState") {
+        Ok(fx) => fx,
+        Err(e) => return Ok(PatchState::Unknown(format!("could not locate getBattleState by name: {e}"))),
+    };
+    let f = code
+        .functions
+        .iter()
+        .find(|f| f.findex.0 == gate_findex)
+        .context("resolved findex vanished immediately after being found -- this should be impossible")?;
+    Ok(match f.ops.len() {
+        14 => PatchState::Vanilla,
+        31 => PatchState::Patched,
+        n => PatchState::Unknown(format!(
+            "getBattleState has {n} ops -- neither the known vanilla (14) nor patched (31) shape"
+        )),
+    })
+}
+
+fn cmd_status(live_path: &Path) -> Result<()> {
     // Exit code is the machine-readable contract other tools (the Python client) rely on:
     // 0 = currently patched, 1 = not currently patched (apply needed), 2 = error (can't
     // tell at all). Stdout text is for humans only -- don't rely on it elsewhere.
@@ -370,15 +486,22 @@ fn cmd_status(live_path: &Path, backup_path: &Path) -> Result<()> {
         println!("No hlboot.dat found at {}", live_path.display());
         std::process::exit(2);
     }
-    if !backup_path.exists() {
-        println!("Not yet patched (no backup present at {}) -- run 'apply'.", backup_path.display());
-        std::process::exit(1);
-    }
-    if fs::read(live_path)? == fs::read(backup_path)? {
-        println!("hlboot.dat matches the pristine backup -- not currently patched.");
-        std::process::exit(1);
-    } else {
-        println!("hlboot.dat differs from the pristine backup -- currently patched.");
+    match check_battle_state_patched(live_path) {
+        Ok(PatchState::Vanilla) => {
+            println!("getBattleState is vanilla -- not currently patched.");
+            std::process::exit(1);
+        }
+        Ok(PatchState::Patched) => {
+            println!("getBattleState has the Archipelago marker check installed -- currently patched.");
+        }
+        Ok(PatchState::Unknown(reason)) => {
+            println!("Can't tell if patched: {reason} -- Northgard was likely updated; run 'apply' to re-verify/re-patch.");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            println!("Could not parse hlboot.dat: {e}");
+            std::process::exit(2);
+        }
     }
     Ok(())
 }
@@ -466,9 +589,9 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     let marker_prefix = format!("{}\\", unlock_dir.display());
     let non_linear_flag_path = config_dir.join(NON_LINEAR_FLAG_NAME).display().to_string();
 
-    patch_get_battle_state(&mut code, &marker_prefix, &non_linear_flag_path)?;
+    let unlocked_global = patch_get_battle_state(&mut code, &marker_prefix, &non_linear_flag_path)?;
     patch_map_auto_refresh(&mut code)?;
-    patch_reveal_uses_real_state(&mut code)?;
+    patch_reveal_uses_real_state(&mut code, unlocked_global)?;
     patch_path_dedup_by_column(&mut code)?;
     patch_animate_last_path_invokes_callback_when_skipped(&mut code)?;
 
@@ -492,7 +615,18 @@ fn config_dir_path() -> Result<PathBuf> {
     Ok(PathBuf::from(profile).join("Saved Games").join("Archipelago").join("Northgard"))
 }
 
-fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_flag_path: &str) -> Result<()> {
+/// Returns the raw `RefGlobal` index for the `BattleState.Unlocked` enum constructor --
+/// extracted from getBattleState's own original op10 (`GetGlobal reg3 = global(Unlocked)`,
+/// see the shape check above) rather than a second hardcoded constant, since this global
+/// index drifts across Northgard updates exactly the same way findices do. Callers that
+/// need to recognize the *same* Unlocked value elsewhere (patch_reveal_uses_real_state)
+/// take it as a parameter instead of re-deriving or hardcoding it themselves.
+fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_flag_path: &str) -> Result<usize> {
+    let gate_findex = find_method_findex(code, "gamesys.conquest.Conquest", "getBattleState")?;
+    let string_add_findex = find_method_findex(code, "$String", "__add__")?;
+    let get_path_findex = find_method_findex(code, "$Sys", "getPath")?;
+    let sys_exists_findex = find_native_findex(code, "std", "sys_exists")?;
+
     let prefix_ref = RefString(code.strings.len());
     code.strings.push(marker_prefix.into());
     let nl_flag_ref = RefString(code.strings.len());
@@ -510,7 +644,7 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
     let add_fn = code
         .functions
         .iter()
-        .find(|f| f.findex.0 == STRING_ADD_FINDEX)
+        .find(|f| f.findex.0 == string_add_findex)
         .context("could not find String.__add__ -- Northgard build mismatch?")?;
     let field_length = match &add_fn.ops[7] {
         Opcode::Field { field, .. } => *field,
@@ -532,7 +666,7 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
     let f = code
         .functions
         .iter_mut()
-        .find(|f| f.findex.0 == GATE_FINDEX)
+        .find(|f| f.findex.0 == gate_findex)
         .context("could not find Conquest.getBattleState -- Northgard build mismatch?")?;
 
     if f.ops.len() != 14 || f.regs.len() != 8 {
@@ -549,6 +683,13 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
     let orig = f.ops.clone();
     let orig_debug = f.debug_info.clone();
     let bool_ty = f.regs[5];
+    let unlocked_global = match &orig[10] {
+        Opcode::GetGlobal { global, .. } => global.0,
+        other => bail!(
+            "getBattleState op10 doesn't match the expected GetGlobal(Unlocked) (got {other:?}) \
+             -- Northgard build mismatch? Re-verify with `dump` before trusting this patch."
+        ),
+    };
 
     f.regs.push(bytes_ty); // reg8: non-linear flag path, raw HBYTES from String{}
     f.regs.push(int_ty); // reg9: non-linear flag path length
@@ -591,8 +732,8 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
         /*11*/ New { dst: reg_nl_str },
         /*12*/ SetField { obj: reg_nl_str, field: field_bytes, src: reg_nl_bytes },
         /*13*/ SetField { obj: reg_nl_str, field: field_length, src: reg_nl_len },
-        /*14*/ Call1 { dst: reg_nl_pathbytes, fun: RefFun(GET_PATH_FINDEX), arg0: reg_nl_str },
-        /*15*/ Call1 { dst: reg_nl_exists, fun: RefFun(SYS_EXISTS_FINDEX), arg0: reg_nl_pathbytes },
+        /*14*/ Call1 { dst: reg_nl_pathbytes, fun: RefFun(get_path_findex), arg0: reg_nl_str },
+        /*15*/ Call1 { dst: reg_nl_exists, fun: RefFun(sys_exists_findex), arg0: reg_nl_pathbytes },
         /*16*/ JTrue { cond: reg_nl_exists, offset: 1 }, // -> 18 (skip adjacency gate)
         /*17*/ JFalse { cond: Reg(5), offset: 11 }, // -> 29 (Locked) if the game's own check already says no
         /*18*/ String { dst: reg_prefix_bytes, ptr: prefix_ref },
@@ -600,9 +741,9 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
         /*20*/ New { dst: reg_prefix_str },
         /*21*/ SetField { obj: reg_prefix_str, field: field_bytes, src: reg_prefix_bytes },
         /*22*/ SetField { obj: reg_prefix_str, field: field_length, src: reg_len },
-        /*23*/ Call2 { dst: reg_concat, fun: RefFun(STRING_ADD_FINDEX), arg0: reg_prefix_str, arg1: Reg(1) },
-        /*24*/ Call1 { dst: reg_pathbytes, fun: RefFun(GET_PATH_FINDEX), arg0: reg_concat },
-        /*25*/ Call1 { dst: reg_exists, fun: RefFun(SYS_EXISTS_FINDEX), arg0: reg_pathbytes },
+        /*23*/ Call2 { dst: reg_concat, fun: RefFun(string_add_findex), arg0: reg_prefix_str, arg1: Reg(1) },
+        /*24*/ Call1 { dst: reg_pathbytes, fun: RefFun(get_path_findex), arg0: reg_concat },
+        /*25*/ Call1 { dst: reg_exists, fun: RefFun(sys_exists_findex), arg0: reg_pathbytes },
         /*26*/ JFalse { cond: reg_exists, offset: 2 }, // -> 29 (Locked) if no marker file
         /*27*/ orig[10].clone(), // Unlocked: GetGlobal reg3 = global(Unlocked)
         /*28*/ orig[11].clone(), // Ret reg3
@@ -621,7 +762,7 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
         ];
     }
     f.assigns = Some(Vec::new());
-    Ok(())
+    Ok(unlocked_global)
 }
 
 /// Register type of an existing, known-good function's register -- used to source correctly
@@ -654,22 +795,30 @@ fn reg_type(code: &Bytecode, findex: usize, reg: usize, what: &str) -> Result<Re
 /// cached, so this doesn't need to duplicate that comparison -- it can call it unconditionally
 /// for every node, every frame.
 fn patch_map_auto_refresh(code: &mut Bytecode) -> Result<()> {
-    let conquest_ty = reg_type(code, HAS_NEXT_TO_UNLOCK_FINDEX, 3, "gamesys.conquest.Conquest")?;
-    let map_container_ty = reg_type(code, HAS_NEXT_TO_UNLOCK_FINDEX, 14, "ui.menus.conquest.MapContainer")?;
-    let battle_state_ty = reg_type(code, HAS_NEXT_TO_UNLOCK_FINDEX, 15, "enum<BattleState>")?;
-    let array_obj_ty = reg_type(code, GET_BUTTON_FINDEX, 4, "hl.types.ArrayObj")?;
-    let dynamic_ty = reg_type(code, GET_BUTTON_FINDEX, 8, "dynamic")?;
-    let raw_array_ty = reg_type(code, GET_BUTTON_FINDEX, 9, "array")?;
-    let map_button_ty = reg_type(code, GET_BUTTON_FINDEX, 11, "ui.menus.conquest.MapButton")?;
-    let battle_ty = reg_type(code, GET_BUTTON_BY_ID_FINDEX, 14, "gamesys.conquest.Battle")?;
-    let battle_data_ty = reg_type(code, GET_BUTTON_BY_ID_FINDEX, 13, "Battle.data virtual")?;
-    let string_ty = reg_type(code, GET_BUTTON_BY_ID_FINDEX, 1, "String")?;
-    let callback_ty = reg_type(code, CHANGE_STATE_FINDEX, 2, "() -> void callback")?;
+    let gate_findex = find_method_findex(code, "gamesys.conquest.Conquest", "getBattleState")?;
+    let update_findex = find_method_findex(code, "ui.menus.conquest.ConquestMapContent", "update")?;
+    let change_state_findex = find_method_findex(code, "ui.menus.conquest.MapButton", "changeState")?;
+    let has_next_to_unlock_findex =
+        find_method_findex(code, "ui.menus.conquest.ConquestMapContent", "hasNextToUnlock")?;
+    let get_button_findex = find_method_findex(code, "ui.menus.conquest.MapContainer", "getButton")?;
+    let get_button_by_id_findex = find_method_findex(code, "ui.menus.conquest.MapContainer", "getButtonById")?;
+
+    let conquest_ty = reg_type(code, has_next_to_unlock_findex, 3, "gamesys.conquest.Conquest")?;
+    let map_container_ty = reg_type(code, has_next_to_unlock_findex, 14, "ui.menus.conquest.MapContainer")?;
+    let battle_state_ty = reg_type(code, has_next_to_unlock_findex, 15, "enum<BattleState>")?;
+    let array_obj_ty = reg_type(code, get_button_findex, 4, "hl.types.ArrayObj")?;
+    let dynamic_ty = reg_type(code, get_button_findex, 8, "dynamic")?;
+    let raw_array_ty = reg_type(code, get_button_findex, 9, "array")?;
+    let map_button_ty = reg_type(code, get_button_findex, 11, "ui.menus.conquest.MapButton")?;
+    let battle_ty = reg_type(code, get_button_by_id_findex, 14, "gamesys.conquest.Battle")?;
+    let battle_data_ty = reg_type(code, get_button_by_id_findex, 13, "Battle.data virtual")?;
+    let string_ty = reg_type(code, get_button_by_id_findex, 1, "String")?;
+    let callback_ty = reg_type(code, change_state_findex, 2, "() -> void callback")?;
 
     let f = code
         .functions
         .iter_mut()
-        .find(|f| f.findex.0 == UPDATE_FINDEX)
+        .find(|f| f.findex.0 == update_findex)
         .context("could not find ConquestMapContent.update -- Northgard build mismatch?")?;
 
     let i32_ty = *f
@@ -766,9 +915,9 @@ fn patch_map_auto_refresh(code: &mut Bytecode) -> Result<()> {
         /*33*/ Field { dst: r_battle_data, obj: r_battle, field: field_battle_data },
         /*34*/ NullCheck { reg: r_battle_data },
         /*35*/ Field { dst: r_infid, obj: r_battle_data, field: field_infid },
-        /*36*/ Call2 { dst: r_new_state, fun: RefFun(GATE_FINDEX), arg0: r_conquest, arg1: r_infid },
+        /*36*/ Call2 { dst: r_new_state, fun: RefFun(gate_findex), arg0: r_conquest, arg1: r_infid },
         /*37*/ Null { dst: r_null_cb },
-        /*38*/ Call3 { dst: void_reg, fun: RefFun(CHANGE_STATE_FINDEX), arg0: r_button, arg1: r_new_state, arg2: r_null_cb },
+        /*38*/ Call3 { dst: void_reg, fun: RefFun(change_state_findex), arg0: r_button, arg1: r_new_state, arg2: r_null_cb },
         /*39*/ JAlways { offset: -22 }, // -> 18 (INNER_LABEL)
     ];
     let prelude_len = prelude.len();
@@ -799,11 +948,15 @@ fn patch_map_auto_refresh(code: &mut Bytecode) -> Result<()> {
 /// the loop already has the live `Conquest` instance (reg6) and this node's `infId` (reg4)
 /// in registers -- exactly `getBattleState`'s two arguments -- so this replaces that one
 /// opcode with a real call, in place, needing no new registers and no jump-offset changes.
-fn patch_reveal_uses_real_state(code: &mut Bytecode) -> Result<()> {
+fn patch_reveal_uses_real_state(code: &mut Bytecode, unlocked_global: usize) -> Result<()> {
+    let gate_findex = find_method_findex(code, "gamesys.conquest.Conquest", "getBattleState")?;
+    let animate_new_battle_plots_findex =
+        find_method_findex(code, "ui.menus.conquest.ConquestMapContent", "animateNewBattlePlots")?;
+
     let f = code
         .functions
         .iter_mut()
-        .find(|f| f.findex.0 == ANIMATE_NEW_BATTLE_PLOTS_FINDEX)
+        .find(|f| f.findex.0 == animate_new_battle_plots_findex)
         .context("could not find ConquestMapContent.animateNewBattlePlots -- Northgard build mismatch?")?;
 
     let op = f
@@ -811,9 +964,9 @@ fn patch_reveal_uses_real_state(code: &mut Bytecode) -> Result<()> {
         .get_mut(ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP)
         .context("animateNewBattlePlots is shorter than expected -- Northgard build mismatch?")?;
     match op {
-        Opcode::GetGlobal { dst, global } if global.0 == GLOBAL_UNLOCKED => {
+        Opcode::GetGlobal { dst, global } if global.0 == unlocked_global => {
             let dst = *dst;
-            *op = Opcode::Call2 { dst, fun: RefFun(GATE_FINDEX), arg0: Reg(6), arg1: Reg(4) };
+            *op = Opcode::Call2 { dst, fun: RefFun(gate_findex), arg0: Reg(6), arg1: Reg(4) };
         }
         other => bail!(
             "animateNewBattlePlots op{ANIMATE_NEW_BATTLE_PLOTS_HARDCODED_UNLOCKED_OP} doesn't \
@@ -844,10 +997,11 @@ fn patch_reveal_uses_real_state(code: &mut Bytecode) -> Result<()> {
 /// `isColumnInPath` call itself is left in place (now simply unused) rather than removed, to
 /// avoid touching anything else in the function's register/jump layout.
 fn patch_path_dedup_by_column(code: &mut Bytecode) -> Result<()> {
+    let battle_completed_findex = find_method_findex(code, "gamesys.conquest.Conquest", "onBattleCompleted")?;
     let f = code
         .functions
         .iter_mut()
-        .find(|f| f.findex.0 == BATTLE_COMPLETED_FINDEX)
+        .find(|f| f.findex.0 == battle_completed_findex)
         .context("could not find Conquest.onBattleCompleted -- Northgard build mismatch?")?;
 
     let op = f
@@ -878,10 +1032,12 @@ fn patch_path_dedup_by_column(code: &mut Bytecode) -> Result<()> {
 /// animation is skipped, so the "unlock everything once this finishes" contract is preserved
 /// either way.
 fn patch_animate_last_path_invokes_callback_when_skipped(code: &mut Bytecode) -> Result<()> {
+    let animate_last_path_findex =
+        find_method_findex(code, "ui.menus.conquest.ConquestMapContent", "animateLastPath")?;
     let f = code
         .functions
         .iter_mut()
-        .find(|f| f.findex.0 == ANIMATE_LAST_PATH_FINDEX)
+        .find(|f| f.findex.0 == animate_last_path_findex)
         .context("could not find ConquestMapContent.animateLastPath -- Northgard build mismatch?")?;
 
     if f.ops.len() != 19 {
