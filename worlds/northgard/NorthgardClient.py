@@ -360,7 +360,13 @@ def _room_key(ctx: "NorthgardContext") -> str | None:
     generated multiworld (RoomInfo packet), unrelated to Northgard's own Conquest seed --
     since it stays correct even if the same room gets rehosted on a different
     address/port. Falls back to the server address if we haven't seen seed_name yet
-    (e.g. /conquest run in the brief window before RoomInfo arrives)."""
+    (e.g. /conquest run in the brief window before RoomInfo arrives).
+
+    seed_name is CommonContext's own "expected seed" validation field (compared against
+    every RoomInfo, with a mismatch aborting server_auth), not a dedicated "current room"
+    field -- the installed Archipelago version (0.6.7) has no separate field for that. Its
+    connect() override (below) clears seed_name before every new connection attempt so a
+    stale value from a previous room can't falsely reject a genuine reconnect."""
     if ctx.seed_name:
         return f"seed:{ctx.seed_name}"
     if ctx.server_address:
@@ -589,6 +595,15 @@ class NorthgardContext(CommonContext):
         ui = super().make_gui()
         ui.base_title = "Archipelago Northgard Client"
         return ui
+
+    async def connect(self, address: str | None = None) -> None:
+        # seed_name is CommonContext's own "expected seed" validation field: it's compared
+        # against every RoomInfo, a mismatch aborts server_auth, and nothing in the installed
+        # Archipelago version (0.6.7) ever resets it between rooms. Clear it before each new
+        # connection attempt so a stale seed_name from a previous room can't get compared
+        # against the next room's RoomInfo and falsely reject a genuine reconnect.
+        self.seed_name = None
+        await super().connect(address)
 
     def _apply_room_pin(self) -> None:
         """Called once we know this connection's room_key (see RoomInfo handling below).
