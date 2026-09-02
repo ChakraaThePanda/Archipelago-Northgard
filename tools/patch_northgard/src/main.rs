@@ -457,10 +457,8 @@ enum PatchState {
     Unknown(String),
 }
 
-fn check_battle_state_patched(live_path: &Path) -> Result<PatchState> {
-    let path_str = live_path.to_str().context("path isn't valid UTF-8")?;
-    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
-    let gate_findex = match find_method_findex(&code, "gamesys.conquest.Conquest", "getBattleState") {
+fn classify_battle_state(code: &Bytecode) -> Result<PatchState> {
+    let gate_findex = match find_method_findex(code, "gamesys.conquest.Conquest", "getBattleState") {
         Ok(fx) => fx,
         Err(e) => return Ok(PatchState::Unknown(format!("could not locate getBattleState by name: {e}"))),
     };
@@ -476,6 +474,12 @@ fn check_battle_state_patched(live_path: &Path) -> Result<PatchState> {
             "getBattleState has {n} ops -- neither the known vanilla (14) nor patched (31) shape"
         )),
     })
+}
+
+fn check_battle_state_patched(live_path: &Path) -> Result<PatchState> {
+    let path_str = live_path.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+    classify_battle_state(&code)
 }
 
 fn cmd_status(live_path: &Path) -> Result<()> {
@@ -563,24 +567,41 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     if !live_path.exists() {
         bail!("No hlboot.dat found at {}", live_path.display());
     }
-    if !backup_path.exists() {
-        // Atomic write-then-rename here too: two racing first-time `apply` calls both see
-        // "no backup yet" and both copy `live_path` -- if that ever raced against the OTHER
-        // one's patched write already landing on live_path, a plain fs::copy could capture a
-        // torn read. Reading fully into memory first, then writing the backup atomically,
-        // means the backup is always either the untouched-but-fully-valid original bytes or
-        // (in the very unlikely case the other racer's rename already won) a complete,
-        // non-torn copy of the now-patched file -- never a partial read either way.
-        let pristine = fs::read(live_path).context("failed to read hlboot.dat to create pristine backup")?;
-        write_atomically(backup_path, &pristine).context("failed to create pristine backup before patching")?;
+
+    // Read live_path exactly once. Deciding "is live currently vanilla" and, if so, both
+    // backing it up AND patching it must all come from this same snapshot, since two
+    // separate reads (one to decide, one to act) leave a gap where a second concurrent
+    // `apply` process's completed write can land in between, making us archive ITS
+    // already-patched output as "pristine" and permanently corrupt the backup that
+    // `restore` relies on.
+    let live_bytes = fs::read(live_path).context("failed to read hlboot.dat")?;
+    let live_parsed = Bytecode::deserialize(io::Cursor::new(&live_bytes));
+    let live_is_vanilla = match &live_parsed {
+        Ok(code) => matches!(classify_battle_state(code), Ok(PatchState::Vanilla)),
+        Err(_) => false,
+    };
+
+    // If live is currently vanilla (unpatched), it's the authoritative pristine build to
+    // patch from, so (re)create the backup from it even when an older backup already
+    // exists. Without this, a real Northgard update (which ships a fresh vanilla
+    // hlboot.dat) would leave `apply` silently re-patching the STALE backup from the
+    // previous build and overwriting the freshly-updated live file with it.
+    if !backup_path.exists() || live_is_vanilla {
+        write_atomically(backup_path, &live_bytes).context("failed to create pristine backup before patching")?;
         println!("Backed up pristine hlboot.dat to {}", backup_path.display());
     }
 
-    let backup_str = backup_path.to_str().context("install dir path isn't valid UTF-8")?;
-    let mut code = Bytecode::from_file(backup_str).context(
-        "failed to parse hlboot.dat -- this Northgard build may not match what this tool \
-         was written against; see docs/DEVELOPMENT.md before trusting this patch",
-    )?;
+    let mut code = if live_is_vanilla {
+        live_parsed.expect("live_is_vanilla is only true when live_parsed is Ok")
+    } else {
+        // Not vanilla: live is already patched (normal idempotent re-apply) or unreadable,
+        // so patch from the last known-pristine backup instead of live itself.
+        let backup_str = backup_path.to_str().context("install dir path isn't valid UTF-8")?;
+        Bytecode::from_file(backup_str).context(
+            "failed to parse hlboot.dat -- this Northgard build may not match what this tool \
+             was written against; see docs/DEVELOPMENT.md before trusting this patch",
+        )?
+    };
 
     let config_dir = config_dir_path()?;
     let unlock_dir = config_dir.join(UNLOCK_SUBDIR);
@@ -589,9 +610,10 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     let marker_prefix = format!("{}\\", unlock_dir.display());
     let non_linear_flag_path = config_dir.join(NON_LINEAR_FLAG_NAME).display().to_string();
 
-    let unlocked_global = patch_get_battle_state(&mut code, &marker_prefix, &non_linear_flag_path)?;
-    patch_map_auto_refresh(&mut code)?;
-    patch_reveal_uses_real_state(&mut code, unlocked_global)?;
+    let gate_findex = find_method_findex(&code, "gamesys.conquest.Conquest", "getBattleState")?;
+    let unlocked_global = patch_get_battle_state(&mut code, gate_findex, &marker_prefix, &non_linear_flag_path)?;
+    patch_map_auto_refresh(&mut code, gate_findex)?;
+    patch_reveal_uses_real_state(&mut code, gate_findex, unlocked_global)?;
     patch_path_dedup_by_column(&mut code)?;
     patch_animate_last_path_invokes_callback_when_skipped(&mut code)?;
 
@@ -621,8 +643,12 @@ fn config_dir_path() -> Result<PathBuf> {
 /// index drifts across Northgard updates exactly the same way findices do. Callers that
 /// need to recognize the *same* Unlocked value elsewhere (patch_reveal_uses_real_state)
 /// take it as a parameter instead of re-deriving or hardcoding it themselves.
-fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_flag_path: &str) -> Result<usize> {
-    let gate_findex = find_method_findex(code, "gamesys.conquest.Conquest", "getBattleState")?;
+fn patch_get_battle_state(
+    code: &mut Bytecode,
+    gate_findex: usize,
+    marker_prefix: &str,
+    non_linear_flag_path: &str,
+) -> Result<usize> {
     let string_add_findex = find_method_findex(code, "$String", "__add__")?;
     let get_path_findex = find_method_findex(code, "$Sys", "getPath")?;
     let sys_exists_findex = find_native_findex(code, "std", "sys_exists")?;
@@ -646,6 +672,15 @@ fn patch_get_battle_state(code: &mut Bytecode, marker_prefix: &str, non_linear_f
         .iter()
         .find(|f| f.findex.0 == string_add_findex)
         .context("could not find String.__add__ -- Northgard build mismatch?")?;
+    if add_fn.ops.len() <= 27 || add_fn.regs.len() <= 8 {
+        bail!(
+            "__add__'s shape doesn't match what this patch was designed against \
+             (expected at least 28 ops / 9 regs, got {} ops / {} regs); Northgard was \
+             likely updated, re-verify with hlbc before trusting this tool. See docs/DEVELOPMENT.md.",
+            add_fn.ops.len(),
+            add_fn.regs.len()
+        );
+    }
     let field_length = match &add_fn.ops[7] {
         Opcode::Field { field, .. } => *field,
         other => bail!("__add__ op7 shape changed (expected Field), got {other:?} -- Northgard build mismatch?"),
@@ -794,8 +829,7 @@ fn reg_type(code: &Bytecode, findex: usize, reg: usize, what: &str) -> Result<Re
 /// `MapButton.changeState` is itself a no-op if the state passed in matches what's already
 /// cached, so this doesn't need to duplicate that comparison -- it can call it unconditionally
 /// for every node, every frame.
-fn patch_map_auto_refresh(code: &mut Bytecode) -> Result<()> {
-    let gate_findex = find_method_findex(code, "gamesys.conquest.Conquest", "getBattleState")?;
+fn patch_map_auto_refresh(code: &mut Bytecode, gate_findex: usize) -> Result<()> {
     let update_findex = find_method_findex(code, "ui.menus.conquest.ConquestMapContent", "update")?;
     let change_state_findex = find_method_findex(code, "ui.menus.conquest.MapButton", "changeState")?;
     let has_next_to_unlock_findex =
@@ -948,8 +982,7 @@ fn patch_map_auto_refresh(code: &mut Bytecode) -> Result<()> {
 /// the loop already has the live `Conquest` instance (reg6) and this node's `infId` (reg4)
 /// in registers -- exactly `getBattleState`'s two arguments -- so this replaces that one
 /// opcode with a real call, in place, needing no new registers and no jump-offset changes.
-fn patch_reveal_uses_real_state(code: &mut Bytecode, unlocked_global: usize) -> Result<()> {
-    let gate_findex = find_method_findex(code, "gamesys.conquest.Conquest", "getBattleState")?;
+fn patch_reveal_uses_real_state(code: &mut Bytecode, gate_findex: usize, unlocked_global: usize) -> Result<()> {
     let animate_new_battle_plots_findex =
         find_method_findex(code, "ui.menus.conquest.ConquestMapContent", "animateNewBattlePlots")?;
 
