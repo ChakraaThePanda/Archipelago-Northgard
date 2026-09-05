@@ -81,11 +81,27 @@ class NorthgardWorld(World):
             # (see NorthgardClient._sync_unlock_markers), so the region graph must match --
             # every Chapter hangs directly off Menu, gated only by its own item, instead of
             # requiring its ancestors' regions to be reached first.
+            requirement = self.options.chapter7_requirement.value
+            other_chapters = [c for c in CHAPTERS if c != FINAL_CHAPTER]
             for chapter in CHAPTERS:
                 if chapter == STARTING_CHAPTER:
                     continue
                 entrance = menu.connect(regions[chapter], f"Menu -> {chapter} (non-linear)")
-                set_rule(entrance, lambda state, item=chapter: state.has(item, self.player))
+                if chapter == FINAL_CHAPTER and requirement > 0:
+                    # Approximates _sync_unlock_markers' in-game gate in logic too -- otherwise
+                    # fill is free to strand one of the other Chapters' own unlock items behind
+                    # Chapter 07, which the client won't open until that Chapter is won. Not an
+                    # exact mirror: AP logic reasons about eventual reachability, not real-time
+                    # completion order, so it can go "in logic" slightly before the client
+                    # actually opens Chapter 07. Chapter 01's precollected item counts toward
+                    # the requirement by design (requirement=5 means Chapter 01 + 4 others).
+                    def final_chapter_rule(state, item=chapter, req=requirement, others=other_chapters):
+                        return state.has(item, self.player) and sum(
+                            state.has(other, self.player) for other in others
+                        ) >= req
+                    set_rule(entrance, final_chapter_rule)
+                else:
+                    set_rule(entrance, lambda state, item=chapter: state.has(item, self.player))
         else:
             for chapter, targets in CHAPTER_CONNECTIONS.items():
                 for target in targets:
