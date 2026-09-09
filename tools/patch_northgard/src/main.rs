@@ -22,8 +22,8 @@
 
 use anyhow::{bail, Context, Result};
 use hlbc::opcodes::Opcode;
-use hlbc::types::{Reg, RefField, RefFun, RefInt, RefString, RefType};
-use hlbc::Bytecode;
+use hlbc::types::{ObjField, Reg, RefField, RefFloat, RefFun, RefInt, RefString, RefType, Type};
+use hlbc::{Bytecode, Resolve};
 use std::env;
 use std::fs;
 use std::fs::File;
@@ -77,6 +77,44 @@ const FIELD_BATTLEDATA_INFID: usize = 1; // virtual{infId, ...}.infId
 const UNLOCK_SUBDIR: &str = "unlocked";
 const NON_LINEAR_FLAG_NAME: &str = "non_linear_mode.flag";
 
+// Live/one-shot resource grants (see patch_player_update_grants_resources below). Kept
+// separate from UNLOCK_SUBDIR since these markers are one-shot (consumed+deleted by the
+// patched game the instant it grants them) rather than persistent per-node state.
+//
+// Resource ids below are `_Data.ResourceKind`'s own string constants (confirmed via
+// `patch_northgard listfields <dir> "_Data.$ResourceKind_Impl_"`), passed straight to
+// `ResourcesComponent.addResource`'s generic (non-money/food/wood-dedicated) dispatch,
+// confirmed live and repeatedly, both solo and cross-clan. A grant lists more than one id
+// only when a resource's *internal* name varies by clan theme (e.g. Lore is "Faith" for some
+// clans, and military XP is "HuntTrophy" for Lynx); addResource silently no-ops for
+// whichever alias isn't the current clan's own, so listing every known one is always safe.
+const PENDING_RESOURCES_SUBDIR: &str = "pending_resources";
+
+/// One resource's whole live-grant configuration: its marker file basenames, its
+/// `_Data.ResourceKind` alias(es), and its two tunable amounts. Both marker names are fixed,
+/// single files, not a stack or pool, since "Useful" items are each a single, non-stacking
+/// copy per Items.py, so there's nothing to count past one; "Filler" items are session-live
+/// one-shots, however many copies get received.
+struct ResourceConfig {
+    key: &'static str, // used only to build marker filenames below, e.g. "money"
+    resource_ids: &'static [&'static str],
+    useful_amount: f64, // "Extra Starting <X>", applied once at the start of every future battle
+    filler_amount: f64, // instant on-the-spot grant, session-live, forfeited if received offline
+}
+
+// TUNE FREELY: these seven rows are the entire balance knob for every live-grant item this
+// world defines. Changing a number here just needs `patch_northgard apply` re-run; nothing
+// else (Items.py, the client) encodes an amount anywhere.
+const RESOURCE_CONFIGS: &[ResourceConfig] = &[
+    ResourceConfig { key: "money", resource_ids: &["Money"], useful_amount: 50.0, filler_amount: 100.0 },
+    ResourceConfig { key: "food", resource_ids: &["Food"], useful_amount: 50.0, filler_amount: 100.0 },
+    ResourceConfig { key: "wood", resource_ids: &["Wood"], useful_amount: 50.0, filler_amount: 100.0 },
+    ResourceConfig { key: "lore", resource_ids: &["Lore", "Faith"], useful_amount: 40.0, filler_amount: 200.0 },
+    ResourceConfig { key: "stone", resource_ids: &["Stone"], useful_amount: 5.0, filler_amount: 10.0 },
+    ResourceConfig { key: "iron", resource_ids: &["Iron"], useful_amount: 5.0, filler_amount: 10.0 },
+    ResourceConfig { key: "military_xp", resource_ids: &["MilitaryXP", "HuntTrophy"], useful_amount: 25.0, filler_amount: 200.0 },
+];
+
 /// Finds a class method's current findex by name instead of a hardcoded number.
 /// Northgard renumbers its whole function table on every recompile, but a method's
 /// (owning class, method name) pair is tied to the game's own Haxe source and stays put
@@ -122,6 +160,109 @@ fn find_native_findex(code: &Bytecode, lib: &str, name: &str) -> Result<usize> {
         .with_context(|| format!("could not find native {lib}.{name} -- Northgard build mismatch?"))
 }
 
+/// Finds the index into `code.types` of the `Obj` type named `class_name`, or `None` if no
+/// such class exists. Shared by every lookup below that needs to locate a class by name
+/// before doing something with it (reading a field, listing fields, adding a field).
+fn find_type_index_by_name(code: &Bytecode, class_name: &str) -> Option<usize> {
+    code.types.iter().position(|t| matches!(t, Type::Obj(obj) if obj.name(code) == class_name))
+}
+
+/// Finds a class field's `RefField` (and its declared type) by (class name, field name)
+/// instead of a hardcoded index, following the same by-name-not-by-index philosophy as
+/// find_method_findex, applied to fields. `fields` (not `own_fields`) already includes
+/// inherited ones, matching what a real `GetThis`/`Field` access on an instance of this class
+/// can reach.
+fn find_field_by_name(code: &Bytecode, class_name: &str, field_name: &str) -> Result<(RefField, RefType)> {
+    let type_index = find_type_index_by_name(code, class_name)
+        .with_context(|| format!("could not find class {class_name}. Northgard build mismatch?"))?;
+    let Type::Obj(obj) = &code.types[type_index] else {
+        bail!("internal error: type_index didn't resolve back to an Obj");
+    };
+    obj.fields
+        .iter()
+        .position(|f| f.name(code) == field_name)
+        .map(|i| (RefField(i), obj.fields[i].t))
+        .with_context(|| format!("class {class_name} has no field named {field_name}. Northgard build mismatch?"))
+}
+
+fn cmd_native_sig(backup_path: &Path, live_path: &Path, lib: &str, name: &str) -> Result<()> {
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+    let n = code
+        .natives
+        .iter()
+        .find(|n| n.lib(&code) == lib && n.name(&code) == name)
+        .context("native not found")?;
+    let ty = n.ty(&code);
+    println!("{lib}.{name}@{}: args={:?} ret={:?}", n.findex.0, ty.args, ty.ret);
+    for (i, a) in ty.args.iter().enumerate() {
+        println!("  arg{i} = {}", a.display::<hlbc::fmt::EnhancedFmt>(&code));
+    }
+    println!("  ret = {}", ty.ret.display::<hlbc::fmt::EnhancedFmt>(&code));
+    Ok(())
+}
+
+fn cmd_list_fields(backup_path: &Path, live_path: &Path, class_name: &str) -> Result<()> {
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+    let type_index = find_type_index_by_name(&code, class_name).context("class not found")?;
+    let Type::Obj(obj) = &code.types[type_index] else {
+        bail!("internal error: type_index didn't resolve back to an Obj");
+    };
+    for (i, f) in obj.fields.iter().enumerate() {
+        println!("[{i}] {} : {}", f.name(&code), f.t.display::<hlbc::fmt::EnhancedFmt>(&code));
+    }
+    println!("total fields: {}", obj.fields.len());
+    Ok(())
+}
+
+fn cmd_find_field_anywhere(backup_path: &Path, live_path: &Path, field_name: &str) -> Result<()> {
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+    let mut count = 0;
+    for t in &code.types {
+        if let Type::Obj(obj) = t {
+            for f in &obj.own_fields {
+                if f.name(&code).to_string().eq_ignore_ascii_case(field_name) {
+                    println!(
+                        "{} . {} : {}",
+                        obj.name(&code),
+                        f.name(&code),
+                        f.t.display::<hlbc::fmt::EnhancedFmt>(&code)
+                    );
+                    count += 1;
+                }
+            }
+        }
+    }
+    println!("total: {count}");
+    Ok(())
+}
+
+fn cmd_subclasses(backup_path: &Path, live_path: &Path, class_name: &str) -> Result<()> {
+    let source = if backup_path.exists() { backup_path } else { live_path };
+    let path_str = source.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+    let mut count = 0;
+    for t in &code.types {
+        if let Type::Obj(obj) = t {
+            if let Some(super_ref) = obj.super_ {
+                if let Type::Obj(super_obj) = code.get(super_ref) {
+                    if super_obj.name(&code) == class_name {
+                        println!("{} extends {class_name} directly", obj.name(&code));
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!("total direct subclasses of {class_name}: {count}");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let usage = "usage: patch_northgard <status|apply|restore> <Northgard install dir>";
@@ -163,6 +304,33 @@ fn main() -> Result<()> {
             cmd_whois(&backup_path, &live_path, findex)
         }
         "natives" => cmd_natives(&backup_path, &live_path),
+        "listfields" => {
+            let class_name = args.get(3).context("usage: patch_northgard listfields <dir> <class>")?;
+            cmd_list_fields(&backup_path, &live_path, class_name)
+        }
+        "findfield" => {
+            let field_name = args.get(3).context("usage: patch_northgard findfield <dir> <field>")?;
+            cmd_find_field_anywhere(&backup_path, &live_path, field_name)
+        }
+        "natsig" => {
+            let lib = args.get(3).context("usage: patch_northgard natsig <dir> <lib> <name>")?;
+            let name = args.get(4).context("usage: patch_northgard natsig <dir> <lib> <name>")?;
+            cmd_native_sig(&backup_path, &live_path, lib, name)
+        }
+        "subclasses" => {
+            let class_name = args.get(3).context("usage: patch_northgard subclasses <dir> <class>")?;
+            cmd_subclasses(&backup_path, &live_path, class_name)
+        }
+        "resolvefn" => {
+            let class_name = args.get(3).context("usage: patch_northgard resolvefn <dir> <class> <method>")?;
+            let method_name = args.get(4).context("usage: patch_northgard resolvefn <dir> <class> <method>")?;
+            let source = if backup_path.exists() { &backup_path } else { &live_path };
+            let path_str = source.to_str().context("path isn't valid UTF-8")?;
+            let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+            let findex = find_method_findex(&code, class_name, method_name)?;
+            println!("{class_name}.{method_name} -> findex {findex}");
+            Ok(())
+        }
         _ => bail!(usage),
     }
 }
@@ -617,6 +785,34 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     patch_path_dedup_by_column(&mut code)?;
     patch_animate_last_path_invokes_callback_when_skipped(&mut code)?;
 
+    let pending_resources_dir = config_dir.join(PENDING_RESOURCES_SUBDIR);
+    fs::create_dir_all(&pending_resources_dir).context("failed to create the pending-resources directory")?;
+
+    // One fixed, single-file marker per resource per grant kind. "Useful" items are each a
+    // single non-stacking copy (Items.py never places more than one), so there's nothing to
+    // pool/stack here the way the old "Extra Starting Food" design needed; "Filler" items are
+    // session-live one-shots regardless of how many copies get received (NorthgardClient.py
+    // resolves each received copy to its own turn at this same single marker file, one at a
+    // time, rather than needing a distinct marker per pending copy).
+    let mut grants = Vec::with_capacity(RESOURCE_CONFIGS.len() * 2);
+    for cfg in RESOURCE_CONFIGS {
+        grants.push(ResourceGrant {
+            kind: GrantKind::Useful,
+            key: cfg.key,
+            marker_path: pending_resources_dir.join(format!("useful_{}.flag", cfg.key)).display().to_string(),
+            resource_ids: cfg.resource_ids,
+            amount: cfg.useful_amount,
+        });
+        grants.push(ResourceGrant {
+            kind: GrantKind::Filler,
+            key: cfg.key,
+            marker_path: pending_resources_dir.join(format!("filler_{}.flag", cfg.key)).display().to_string(),
+            resource_ids: cfg.resource_ids,
+            amount: cfg.filler_amount,
+        });
+    }
+    patch_player_update_grants_resources(&mut code, &grants)?;
+
     let mut serialized = Vec::new();
     code.serialize(&mut serialized).context("failed to serialize patched bytecode")?;
     write_atomically(live_path, &serialized).context("failed to write patched hlboot.dat")?;
@@ -624,6 +820,7 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     println!("Patched hlboot.dat installed at {}", live_path.display());
     println!("Marker directory: {unlock_dir_display}", unlock_dir_display = unlock_dir.display());
     println!("Non-linear-mode flag file (its mere presence skips the adjacency check): {non_linear_flag_path}");
+    println!("Pending-resources directory: {}", pending_resources_dir.display());
     Ok(())
 }
 
@@ -671,7 +868,7 @@ fn patch_get_battle_state(
         .functions
         .iter()
         .find(|f| f.findex.0 == string_add_findex)
-        .context("could not find String.__add__ -- Northgard build mismatch?")?;
+        .context("could not find String.__add__. Northgard build mismatch?")?;
     if add_fn.ops.len() <= 27 || add_fn.regs.len() <= 8 {
         bail!(
             "__add__'s shape doesn't match what this patch was designed against \
@@ -683,11 +880,11 @@ fn patch_get_battle_state(
     }
     let field_length = match &add_fn.ops[7] {
         Opcode::Field { field, .. } => *field,
-        other => bail!("__add__ op7 shape changed (expected Field), got {other:?} -- Northgard build mismatch?"),
+        other => bail!("__add__ op7 shape changed (expected Field), got {other:?}. Northgard build mismatch?"),
     };
     let field_bytes = match &add_fn.ops[27] {
         Opcode::Field { field, .. } => *field,
-        other => bail!("__add__ op27 shape changed (expected Field), got {other:?} -- Northgard build mismatch?"),
+        other => bail!("__add__ op27 shape changed (expected Field), got {other:?}. Northgard build mismatch?"),
     };
     let string_ty = add_fn.regs[0]; // the real boxed String class
     let bytes_ty = add_fn.regs[8]; // raw HBYTES, matching what String{} actually produces
@@ -798,6 +995,449 @@ fn patch_get_battle_state(
     }
     f.assigns = Some(Vec::new());
     Ok(unlocked_global)
+}
+
+/// Which of the two marker lifetimes a grant uses. See patch_player_update_grants_resources
+/// for what each one actually does differently in the generated bytecode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrantKind {
+    /// Applied once per battle *instance*, gated by this grant's own `key`-specific sentinel
+    /// field (see add_bool_field), and never deletes its marker, since ownership is
+    /// permanent. Each Useful kind gets its OWN sentinel, not one shared by all of them,
+    /// specifically so that a kind received mid-battle, after some other kind already got
+    /// granted this instance, still lands immediately instead of waiting for the next
+    /// battle. Confirmed live that this was worth the extra fields: a single shared sentinel
+    /// regressed exactly that case.
+    Useful,
+    /// Applied once per marker, which IS deleted the instant it's granted. NorthgardClient.py
+    /// is solely responsible for ever writing another one.
+    Filler,
+}
+
+/// One grant slot: "if `marker_path` exists, add `amount` of each of `resource_ids` to the
+/// human player." See patch_player_update_grants_resources for how these get assembled and how
+/// `kind` changes what happens after the grant. Almost always exactly one id (e.g. `["Money"]`);
+/// more than one exists so a single grant can target a resource whose *internal* id varies by
+/// clan theme (e.g. Lore is called "Faith" for some clans), without needing to detect which
+/// clan is actually in play: `ResourcesComponent.addResource` silently no-ops for a kind name
+/// that isn't the current clan's own, so listing every known alias here is always safe, not
+/// just for the right one.
+struct ResourceGrant {
+    kind: GrantKind,
+    key: &'static str, // matches RESOURCE_CONFIGS.key, used to name this grant's own sentinel field (Useful only)
+    marker_path: String,
+    resource_ids: &'static [&'static str],
+    amount: f64,
+}
+
+/// Adds a brand-new field to a class, entirely owned by this patch. No original compiled
+/// code ever reads or writes it, so it's completely invisible to (and safe from interfering
+/// with) real gameplay, save-file serialization, or hxbit's network-replication schema (all of
+/// which only ever touch the specific fields their own macro-generated code was compiled
+/// against; they have no way to "notice" a field that didn't exist at compile time). Every
+/// fresh instance of the class gets it zero-initialized by the VM's own allocator, exactly
+/// like any other field. Confirmed via hlbc's own on-disk format: an object's field list
+/// carries no separate size/offset metadata anywhere (`write.rs` serializes a type's fields by
+/// just writing `own_fields.len()` then each field in order), so there is nothing else that
+/// needs updating to keep a real byte-layout in sync; the HashLink runtime that loads
+/// hlboot.dat computes it from this same field list.
+///
+/// ONLY safe to call on a class with zero subclasses (verified with `patch_northgard
+/// subclasses <dir> <class>` before ever using this). Fields are addressed by a single index
+/// flattened across the whole inheritance chain (parent's own fields first, then each
+/// subclass's own, in order, see hlbc's read.rs), so appending to a class that something
+/// else extends would shift every one of that subclass's own field indices by one, silently
+/// breaking every compiled reference to them.
+fn add_bool_field(code: &mut Bytecode, class_name: &str, field_name: &str, bool_ty: RefType) -> Result<RefField> {
+    let type_index = find_type_index_by_name(code, class_name)
+        .with_context(|| format!("could not find class {class_name}. Northgard build mismatch?"))?;
+
+    let name_ref = RefString(code.strings.len());
+    code.strings.push(field_name.into());
+    let new_field = ObjField { name: name_ref, t: bool_ty };
+
+    match &mut code.types[type_index] {
+        Type::Obj(obj) => {
+            obj.own_fields.push(new_field.clone());
+            let new_index = obj.fields.len();
+            obj.fields.push(new_field);
+            Ok(RefField(new_index))
+        }
+        _ => bail!("internal error: type_index didn't resolve back to an Obj"),
+    }
+}
+
+/// Patches `ent.Player.update(dt)`, which runs every simulation tick for every `ent.Player`
+/// instance that exists, human and AI alike, for as long as an actual match/battle is loaded,
+/// so that the *human* player additionally checks each of `grants`' marker-file paths every
+/// tick and, for any that exist, grants the corresponding resource(s). `NorthgardClient.py` is
+/// what creates these markers; this tool never touches them itself. The two grant kinds
+/// (`GrantKind`) behave differently once granted:
+///   - Filler items (e.g. "100 Food"): the marker is deleted the instant it's granted, so it
+///     can't be re-applied next tick. NorthgardClient.py deletes it itself if it goes
+///     unconsumed too long instead (deliberately session-live, not queued for later).
+///   - Useful items (e.g. "50 Starting Food"): the marker is NEVER deleted. It represents
+///     permanent ownership, and NorthgardClient.py only ever needs to write it once, the first
+///     time the item is received. Instead, applying it exactly once per *battle* (not once
+///     ever) is gated by a dedicated sentinel bool this function adds to
+///     `ent.player.ResourcesComponent` itself, one per resource key (`apUsefulApplied_<key>`,
+///     via add_bool_field), which is `false` on every fresh instance the game constructs: a
+///     new battle, or even just quitting to the Conquest map and re-entering the *same* unwon
+///     battle (confirmed live that this alone, with no chapter completed, was enough to lose
+///     the bonus under the previous NorthgardClient-side-timing design this replaced). This is
+///     the reason a game-side sentinel exists at all: NorthgardClient.py has no reliable
+///     file-based "a battle just started" signal to gate a marker-rewrite on (a save's
+///     `battleFocusId` does get set the instant a battle is chosen, but live-tested against a
+///     real save, it's never flushed back to the .sav file at that point, see save_state.py's
+///     own comment), so the *only* externally-observable proxy it ever had (Chapter
+///     completion) couldn't cover this case. Each Useful kind gets its own independent
+///     sentinel rather than one shared by all of them, so that a kind received mid-battle,
+///     after some other kind already got granted this instance, still lands on this same
+///     check instead of waiting for the next battle.
+///
+/// **Why `ResourcesComponent.addResource` is called with a capitalized resource-kind string**
+/// (e.g. `"Money"`, `"Lore"`), and not the lowercase field name (`"money"`) or the friendlier
+/// `Player.addResource` wrapper: money/food/wood each have their own dedicated, checksum-guarded
+/// branch inside addResource (a `ctrlMoney`-style obfuscated field, `this.money` XOR'd against a
+/// magic constant, that the branch both reads and rewrites), and calling *that* branch from here
+/// reliably threw an internal exception, confirmed live and repeatedly, as did a raw field
+/// write (silently reverted by that same checksum machinery on the next natural income tick) and
+/// `Player.getResource`/`netAddResource`. But addResource also has a second, *generic* dispatch
+/// for resource kinds with no dedicated branch (confirmed via real ruin-reward code, which grants
+/// "Lore"/"Stone"/"Iron"/etc. through this exact call), and, confirmed live, calling that
+/// generic path with a resource kind's real `_Data.ResourceKind` name (capitalized: "Money" not
+/// "money") reaches it instead of the crash-prone dedicated branch, for every resource this was
+/// tried against (Food/Wood/Money/Stone/Iron/Lore/Faith), with no cap other than food's own real
+/// storage-max (which the game enforces correctly on its own).
+///
+/// Prepended as one self-contained block before update()'s own body, the same technique
+/// patch_map_auto_refresh uses and explains: every original jump offset is relative, so
+/// inserting whole instructions uniformly before the entire body leaves every original offset
+/// valid with no need to touch (or risk miscalculating) any of them. The block does its own
+/// fresh `this.aiJob` check up front, reusing the exact field the original op2 already reads
+/// rather than a hardcoded field index, so AI-controlled players skip straight past every
+/// grant slot without ever running them.
+fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceGrant]) -> Result<()> {
+    let update_findex = find_method_findex(code, "ent.Player", "update")?;
+    let get_path_findex = find_method_findex(code, "$Sys", "getPath")?;
+    let sys_exists_findex = find_native_findex(code, "std", "sys_exists")?;
+    let sys_delete_findex = find_native_findex(code, "std", "sys_delete")?;
+    let add_resource_findex = find_method_findex(code, "ent.player.ResourcesComponent", "addResource")?;
+    let (res_field, res_ty) = find_field_by_name(code, "ent.Player", "res")?;
+
+    let add_resource_fn = code
+        .functions
+        .iter()
+        .find(|f| f.findex.0 == add_resource_findex)
+        .context("could not find ent.player.ResourcesComponent.addResource. Northgard build mismatch?")?;
+    if add_resource_fn.regs.len() < 4 {
+        bail!(
+            "ent.player.ResourcesComponent.addResource's shape doesn't match what this patch was \
+             designed against (expected at least 4 regs, got {}). Northgard was likely updated, \
+             so re-verify with hlbc before trusting this tool.",
+            add_resource_fn.regs.len()
+        );
+    }
+    let string_ty = add_resource_fn.regs[1]; // String (resource id arg)
+    let f64_ty = add_resource_fn.regs[2]; // f64 (amount arg)
+    let reason_ty = add_resource_fn.regs[3]; // enum<ent.player.ChangeReason>, left null; see below
+
+    // HashLink's `String{}` opcode only ever loads a raw wide-char pointer, not a real boxed
+    // `hl.types.String` object. See patch_get_battle_state's docstring/docs/DEVELOPMENT.md.
+    // Source the real String class's shape (and a matching raw-bytes/int type) from
+    // String.__add__ exactly the same way that patch already does.
+    let string_add_findex = find_method_findex(code, "$String", "__add__")?;
+    let add_fn = code
+        .functions
+        .iter()
+        .find(|f| f.findex.0 == string_add_findex)
+        .context("could not find String.__add__. Northgard build mismatch?")?;
+    if add_fn.ops.len() <= 27 || add_fn.regs.len() <= 8 {
+        bail!(
+            "__add__'s shape doesn't match what this patch was designed against \
+             (expected at least 28 ops / 9 regs, got {} ops / {} regs); Northgard was \
+             likely updated, re-verify with hlbc before trusting this tool.",
+            add_fn.ops.len(),
+            add_fn.regs.len()
+        );
+    }
+    let field_length = match &add_fn.ops[7] {
+        Opcode::Field { field, .. } => *field,
+        other => bail!("__add__ op7 shape changed (expected Field), got {other:?}. Northgard build mismatch?"),
+    };
+    let field_bytes = match &add_fn.ops[27] {
+        Opcode::Field { field, .. } => *field,
+        other => bail!("__add__ op27 shape changed (expected Field), got {other:?}. Northgard build mismatch?"),
+    };
+    let bytes_ty = add_fn.regs[8];
+    let int_ty = add_fn.regs[4];
+    // Sourced directly from sys_exists's own declared native signature, confirmed via
+    // `patch_northgard natsig <dir> std sys_exists` to return bool, rather than guessing at
+    // an unrelated function's register (a mistake made once already: some functions' reg5 or
+    // reg2 are typed completely differently, e.g. void or an array, not bool).
+    let sys_exists_native = code
+        .natives
+        .iter()
+        .find(|n| n.findex.0 == sys_exists_findex)
+        .context("could not find sys_exists native. Northgard build mismatch?")?;
+    let bool_ty = sys_exists_native.ty(code).ret;
+
+    // One independent sentinel per Useful grant, keyed by its own `key` and not shared across
+    // kinds (see GrantKind::Useful's own docstring for why one shared sentinel isn't enough).
+    // Verified once, by hand, before this was ever written: `patch_northgard subclasses <dir>
+    // ent.player.ResourcesComponent` reports zero. See add_bool_field's own docstring for why
+    // that's the load-bearing precondition for this being safe at all, let alone seven times
+    // over.
+    let mut sentinel_fields: Vec<(&'static str, RefField)> = Vec::new();
+    for grant in grants.iter().filter(|g| g.kind == GrantKind::Useful) {
+        let field_name = format!("apUsefulApplied_{}", grant.key);
+        let field = add_bool_field(code, "ent.player.ResourcesComponent", &field_name, bool_ty)?;
+        sentinel_fields.push((grant.key, field));
+    }
+
+    // Fetched, validated, and updated in its own scope, separate from the rest of this
+    // function, which needs to freely push onto code.strings/code.ints/code.floats while
+    // building the prelude below. Rust cannot see those as disjoint from code.functions once
+    // a mutable borrow of the latter is threaded through an ordinary function parameter (only
+    // direct, same-scope field access gets that treatment), so f's borrow has to end here and
+    // get re-acquired afterward, once the whole prelude is ready to write back in one line.
+    let (orig, aijob_field, base) = {
+        let f = code
+            .functions
+            .iter_mut()
+            .find(|f| f.findex.0 == update_findex)
+            .context("could not find ent.Player.update. Northgard build mismatch?")?;
+
+        if f.ops.len() != 10 || f.regs.len() != 5 {
+            bail!(
+                "ent.Player.update's shape doesn't match what this patch was designed against \
+                 (expected 10 ops / 5 regs, got {} ops / {} regs). Northgard was likely \
+                 updated, so re-verify with hlbc before trusting this tool.",
+                f.ops.len(),
+                f.regs.len()
+            );
+        }
+        let orig = f.ops.clone();
+        let aijob_field = match &orig[2] {
+            Opcode::GetThis { field, .. } => *field,
+            other => bail!(
+                "update() op2 shape changed (expected GetThis this.aiJob), got {other:?}. \
+                 Northgard build mismatch."
+            ),
+        };
+        match &orig[3] {
+            Opcode::JNull { .. } => {}
+            other => bail!("update() op3 shape changed (expected JNull), got {other:?}. Northgard build mismatch."),
+        }
+        let aijob_ty = f.regs[3];
+
+        let base = f.regs.len() as u32; // 5
+        f.regs.push(aijob_ty); // base+0  r_aijob
+        f.regs.push(bytes_ty); // base+1  r_marker_bytes
+        f.regs.push(int_ty); // base+2  r_marker_len
+        f.regs.push(string_ty); // base+3  r_marker_str
+        f.regs.push(bytes_ty); // base+4  r_marker_path (native path bytes from getPath)
+        f.regs.push(bool_ty); // base+5  r_exists
+        f.regs.push(bytes_ty); // base+6  r_name_bytes
+        f.regs.push(int_ty); // base+7  r_name_len
+        f.regs.push(string_ty); // base+8  r_name_str
+        f.regs.push(f64_ty); // base+9  r_amount
+        f.regs.push(reason_ty); // base+10 r_reason (always null)
+        f.regs.push(res_ty); // base+11 r_res (this.res)
+        f.regs.push(bool_ty); // base+12 r_grant_result
+        f.regs.push(bool_ty); // base+13 r_delete_result
+        f.regs.push(bool_ty); // base+14 r_sentinel: holds whichever Useful grant's own sentinel is currently being checked
+        f.regs.push(bool_ty); // base+15 r_true: constant, written into a sentinel once its grant is applied
+        // Every grant slot, and every resource-id alias within one grant, reuses these same
+        // registers. Each use's liveness ends before the next one starts, so nothing needs to
+        // be preserved across them, and there is no need for a fresh set of registers per
+        // grant or alias.
+
+        (orig, aijob_field, base)
+    };
+
+    let r_aijob = Reg(base);
+    let r_marker_bytes = Reg(base + 1);
+    let r_marker_len = Reg(base + 2);
+    let r_marker_str = Reg(base + 3);
+    let r_marker_path = Reg(base + 4);
+    let r_exists = Reg(base + 5);
+    let r_name_bytes = Reg(base + 6);
+    let r_name_len = Reg(base + 7);
+    let r_name_str = Reg(base + 8);
+    let r_amount = Reg(base + 9);
+    let r_reason = Reg(base + 10);
+    let r_res = Reg(base + 11);
+    let r_grant_result = Reg(base + 12);
+    let r_delete_result = Reg(base + 13);
+    let r_sentinel = Reg(base + 14);
+    let r_true = Reg(base + 15);
+
+    use Opcode::*;
+    const ALIAS_LEN: i32 = 9; // ops per resource-id alias granted within a slot
+
+    // One grant call for one resource-id alias. Builds its already-interned name string and
+    // grants it, reusing the shared r_res/scratch registers above. The reason argument is
+    // left null, since addResource substitutes its own default in that case, exactly like its
+    // own real callers do when they do not care which reason gets recorded.
+    let build_alias = |name_ref: RefString, name_len_ref: RefInt, amount_ref: RefFloat| -> Vec<Opcode> {
+        vec![
+            /*0*/ String { dst: r_name_bytes, ptr: name_ref },
+            /*1*/ Int { dst: r_name_len, ptr: name_len_ref },
+            /*2*/ New { dst: r_name_str },
+            /*3*/ SetField { obj: r_name_str, field: field_bytes, src: r_name_bytes },
+            /*4*/ SetField { obj: r_name_str, field: field_length, src: r_name_len },
+            /*5*/ Float { dst: r_amount, ptr: amount_ref },
+            /*6*/ Null { dst: r_reason },
+            /*7*/ NullCheck { reg: r_res },
+            /*8*/ Call4 { dst: r_grant_result, fun: RefFun(add_resource_findex), arg0: r_res, arg1: r_name_str, arg2: r_amount, arg3: r_reason },
+        ]
+    };
+
+    // Appends every resource-id alias for one grant, given that its marker has already been
+    // confirmed to exist (the caller is responsible for the marker check and its own
+    // conditional skip around this). `code` is taken as an explicit parameter rather than
+    // captured, so this closure can be called freely alongside the Useful-grant loop below
+    // without a borrow conflict over `code`.
+    let push_aliases = |code: &mut Bytecode, prelude: &mut Vec<Opcode>, grant: &ResourceGrant| -> Result<()> {
+        for resource_id in grant.resource_ids {
+            let name_ref = RefString(code.strings.len());
+            code.strings.push((*resource_id).into());
+            let name_len_ref = RefInt(code.ints.len());
+            code.ints.push(resource_id.len() as i32);
+            let amount_ref = RefFloat(code.floats.len());
+            code.floats.push(grant.amount);
+
+            let alias = build_alias(name_ref, name_len_ref, amount_ref);
+            if alias.len() != ALIAS_LEN as usize {
+                bail!(
+                    "internal error: a resource-grant alias drifted from its expected \
+                     {ALIAS_LEN} ops, so the jump offsets above are no longer valid. Fix \
+                     this before applying."
+                );
+            }
+            prelude.extend(alias);
+        }
+        Ok(())
+    };
+
+    // One Filler grant slot: check its marker, and if present, grant every resource-id alias
+    // and delete the marker. `code` is an explicit parameter for the same reason as
+    // push_aliases above.
+    let push_filler_slot = |code: &mut Bytecode, prelude: &mut Vec<Opcode>, grant: &ResourceGrant| -> Result<()> {
+        let marker_ref = RefString(code.strings.len());
+        code.strings.push(grant.marker_path.as_str().into());
+        let marker_len_ref = RefInt(code.ints.len());
+        code.ints.push(grant.marker_path.len() as i32); // pure ASCII path, so byte count equals UTF-16 char count
+
+        prelude.extend(vec![
+            String { dst: r_marker_bytes, ptr: marker_ref },
+            Int { dst: r_marker_len, ptr: marker_len_ref },
+            New { dst: r_marker_str },
+            SetField { obj: r_marker_str, field: field_bytes, src: r_marker_bytes },
+            SetField { obj: r_marker_str, field: field_length, src: r_marker_len },
+            Call1 { dst: r_marker_path, fun: RefFun(get_path_findex), arg0: r_marker_str },
+            Call1 { dst: r_exists, fun: RefFun(sys_exists_findex), arg0: r_marker_path },
+        ]);
+        let jfalse_index = prelude.len();
+        prelude.push(JFalse { cond: r_exists, offset: 0 }); // patched in below, once this slot's real end is known
+        prelude.push(GetThis { dst: r_res, field: res_field });
+
+        push_aliases(code, prelude, grant)?;
+        prelude.push(Call1 { dst: r_delete_result, fun: RefFun(sys_delete_findex), arg0: r_marker_path });
+
+        let slot_end = prelude.len();
+        prelude[jfalse_index] = JFalse { cond: r_exists, offset: (slot_end - jfalse_index - 1) as i32 };
+        Ok(())
+    };
+
+    let mut prelude = vec![GetThis { dst: r_aijob, field: aijob_field }];
+    let jnotnull_index = prelude.len();
+    prelude.push(JNotNull { reg: r_aijob, offset: 0 }); // offset patched in below, once the real end is known
+
+    // Useful grants: each has its own independent sentinel bool on this.res (see
+    // sentinel_fields above), so each one is applied once per *battle instance* (a fresh
+    // ResourcesComponent, see add_bool_field) on its own schedule, regardless of how many
+    // times NorthgardClient.py has written its marker, and regardless of whether it ever
+    // detects this particular battle starting at all (it does not need to; see this
+    // function's own module-level doc comment). A kind's marker is never deleted here, since
+    // ownership is permanent, so the same marker is exactly what should still be sitting
+    // there the next time a fresh instance checks it. Giving each kind its own sentinel,
+    // instead of one shared by all of them, matters in practice: a kind received mid-battle,
+    // after some other kind already got granted this instance, still lands on this same
+    // check instead of waiting for the next battle.
+    for grant in grants.iter().filter(|g| g.kind == GrantKind::Useful) {
+        let (_, sentinel_field) = *sentinel_fields
+            .iter()
+            .find(|(key, _)| *key == grant.key)
+            .context("internal error: a Useful grant's sentinel field was not registered above")?;
+
+        prelude.push(GetThis { dst: r_res, field: res_field });
+        prelude.push(Field { dst: r_sentinel, obj: r_res, field: sentinel_field });
+        let jtrue_index = prelude.len();
+        prelude.push(JTrue { cond: r_sentinel, offset: 0 }); // patched below: skip this slot entirely if already applied
+
+        let marker_ref = RefString(code.strings.len());
+        code.strings.push(grant.marker_path.as_str().into());
+        let marker_len_ref = RefInt(code.ints.len());
+        code.ints.push(grant.marker_path.len() as i32); // pure ASCII path, so byte count equals UTF-16 char count
+        prelude.extend(vec![
+            String { dst: r_marker_bytes, ptr: marker_ref },
+            Int { dst: r_marker_len, ptr: marker_len_ref },
+            New { dst: r_marker_str },
+            SetField { obj: r_marker_str, field: field_bytes, src: r_marker_bytes },
+            SetField { obj: r_marker_str, field: field_length, src: r_marker_len },
+            Call1 { dst: r_marker_path, fun: RefFun(get_path_findex), arg0: r_marker_str },
+            Call1 { dst: r_exists, fun: RefFun(sys_exists_findex), arg0: r_marker_path },
+        ]);
+        let jfalse_index = prelude.len();
+        prelude.push(JFalse { cond: r_exists, offset: 0 }); // patched below: skip the grant if not owned yet
+        prelude.push(GetThis { dst: r_res, field: res_field });
+
+        push_aliases(code, &mut prelude, grant)?;
+
+        // r_res is still valid here (nothing above reassigns it), so this GetThis is a
+        // provably redundant re-fetch. Left in place deliberately rather than removed: it
+        // executes at most once ever per resource per battle instance (the sentinel above
+        // gates re-entry), so the cost is unmeasurable, and this exact op sequence is the
+        // one already verified correct via a live disassembly dump. Removing it would need
+        // that same verification redone for zero real benefit.
+        prelude.push(GetThis { dst: r_res, field: res_field });
+        prelude.push(Bool { dst: r_true, value: true });
+        prelude.push(SetField { obj: r_res, field: sentinel_field, src: r_true });
+
+        let slot_end = prelude.len();
+        prelude[jtrue_index] = JTrue { cond: r_sentinel, offset: (slot_end - jtrue_index - 1) as i32 };
+        prelude[jfalse_index] = JFalse { cond: r_exists, offset: (slot_end - jfalse_index - 1) as i32 };
+    }
+
+    // Filler grants: unchanged from before. Checked and deleted every tick, independent of
+    // any Useful sentinel.
+    for grant in grants.iter().filter(|g| g.kind == GrantKind::Filler) {
+        push_filler_slot(code, &mut prelude, grant)?;
+    }
+
+    let prelude_len_before_body = prelude.len();
+    prelude[jnotnull_index] = JNotNull { reg: r_aijob, offset: (prelude_len_before_body - jnotnull_index - 1) as i32 };
+
+    prelude.extend(orig.iter().cloned());
+
+    let f = code
+        .functions
+        .iter_mut()
+        .find(|f| f.findex.0 == update_findex)
+        .context("could not find ent.Player.update. Northgard build mismatch?")?;
+    f.ops = prelude;
+
+    if let Some(debug_info) = &mut f.debug_info {
+        let first = debug_info.first().copied().unwrap_or((0, 0));
+        let mut new_debug = vec![first; prelude_len_before_body];
+        new_debug.extend(debug_info.iter().copied());
+        *debug_info = new_debug;
+    }
+    f.assigns = Some(Vec::new());
+
+    Ok(())
 }
 
 /// Register type of an existing, known-good function's register -- used to source correctly

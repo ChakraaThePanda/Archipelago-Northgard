@@ -43,6 +43,16 @@ class ConquestRunState:
     map_rows: list[list[str]]  # this save's own randomized infId grid -- see infid_in_map.
     # Kept here (rather than re-decoding the save) so a single read_conquest_run_state call
     # per poll tick can serve both check-sending and infid_in_map lookups.
+    #
+    # There is deliberately no "battle currently in progress" field here. ConquestMapMenu.
+    # startBattle does set a `battleFocusId` field on the live, in-memory `Conquest.data`
+    # object the instant a battle is chosen (confirmed via disassembly), but live-tested
+    # against a real save, that object is never flushed back to this .sav file at that point;
+    # the file on disk simply isn't rewritten again until some later checkpoint (chapter
+    # completion, at least). So a battle starting is invisible to anything polling this file.
+    # NorthgardClient's "Extra Starting X" items no longer depend on detecting it at all: see
+    # patch_northgard's own patch_player_update_grants_resources, which gates each one on a
+    # sentinel field added directly to the patched game itself instead.
 
 
 @dataclass
