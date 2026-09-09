@@ -45,7 +45,7 @@ import Utils
 from CommonClient import gui_enabled, logger, get_base_parser, CommonContext, ClientCommandProcessor, server_loop
 from NetUtils import ClientStatus
 
-from .Items import item_table as northgard_item_table
+from .Items import item_table as northgard_item_table, RESOURCE_KINDS
 from .Locations import location_table as northgard_location_table
 from .Regions import FINAL_CHAPTER
 from .save_state import (
@@ -142,6 +142,32 @@ _UNLOCK_DIR = os.path.join(_CONFIG_DIR, "unlocked")
 # folder's cleanup logic (_cleanup_stale_markers) assumes every file in it is an infId
 # marker for some save's map, which this isn't.
 _NON_LINEAR_FLAG_PATH = os.path.join(_CONFIG_DIR, "non_linear_mode.flag")
+
+# Also read by the patched game binary: one marker per RESOURCE_KINDS entry per grant kind
+# (see patch_northgard's own RESOURCE_CONFIGS/patch_player_update_grants_resources), each
+# checked every simulation tick while a match is loaded. "useful_<key>.flag" is written once,
+# ever, the first time this client sees that kind owned (see _sync_useful_grants), and it's
+# never deleted by anyone; the patched game gates "apply exactly once per battle" itself via
+# its own per-key sentinel field, so ownership just needs to be recorded, not timed.
+# "filler_<key>.flag" is written the moment a filler copy is received, deleted by the game the
+# instant it's granted, or deleted by *this client* itself if it goes unconsumed too long (see
+# _sync_filler_grants). That's the whole point of a filler item being session-live rather than
+# queued for a future session.
+_PENDING_RESOURCES_DIR = os.path.join(_CONFIG_DIR, "pending_resources")
+
+# How long a filler marker is allowed to sit unconsumed before this client gives up and deletes
+# it itself (counting that copy as "resolved" either way, so a reconnect never retries it).
+# Long enough that the patched game's own tick has clearly had a real chance to notice it if a
+# match is actually running (every poll tick already implies several hundred simulation ticks
+# have passed); short enough that "you weren't playing" resolves within a couple of poll ticks
+# rather than lingering visibly.
+_FILLER_MARKER_TIMEOUT_SECONDS = 3 * POLL_INTERVAL_SECONDS
+
+
+def _resource_marker_path(key: str, grant_kind: str) -> str:
+    """`grant_kind` is "useful" or "filler", and must match patch_northgard's own
+    `useful_<key>.flag` / `filler_<key>.flag` naming exactly (see RESOURCE_CONFIGS)."""
+    return os.path.join(_PENDING_RESOURCES_DIR, f"{grant_kind}_{key}.flag")
 
 
 def _set_non_linear_mode(enabled: bool) -> None:
@@ -319,6 +345,26 @@ def _cleanup_stale_markers(old_save_path: str | None, new_save_path: str | None)
             pass
 
 
+def _clear_pending_resource_markers() -> None:
+    """Unlike _UNLOCK_DIR's infId-named markers, _PENDING_RESOURCES_DIR's filenames aren't
+    save-specific at all. There's only ever the same fixed 14 possible paths (one
+    useful/filler pair per RESOURCE_KINDS entry), regardless of which save or room they were
+    written for. So a marker left outstanding by the *previous* room/save (received but
+    never consumed, e.g. no battle was started before switching away) would otherwise get
+    silently picked up and granted by whichever room/save is pinned next. There's no
+    per-save name to scope a targeted removal by, the way _cleanup_stale_markers can for
+    _UNLOCK_DIR. Called on every repin (see /conquest and _apply_room_pin); safe to always
+    clear unconditionally, since whatever the new pin legitimately owns gets rewritten within
+    one poll tick regardless (see filler_marker_written_at getting cleared at the same call
+    sites, and _sync_useful_grants's own unconditional existence check)."""
+    for kind in RESOURCE_KINDS:
+        for grant_kind in ("useful", "filler"):
+            try:
+                os.remove(_resource_marker_path(kind.key, grant_kind))
+            except OSError:
+                pass
+
+
 # One-time migration from the old pre-"Saved Games" location, so upgrading doesn't lose an
 # already-detected save_dir or accumulated per-room pins.
 _OLD_CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".northgard_ap_client_pin.json")
@@ -386,6 +432,26 @@ def _save_pin(room_key: str, filename: str) -> None:
         pins = {}
     pins[room_key] = filename
     config["pins"] = pins
+    _save_config(config)
+
+
+def _load_filler_progress(room_key: str) -> dict[str, int]:
+    """How many filler copies of each RESOURCE_KINDS.key have already been *resolved* (granted
+    live, or given up on after timing out) for this room, keyed by ResourceKind.key rather than
+    item name, so it stays valid even if an item's display name ever changes. Persisted (not
+    just in-memory) so a client restart mid-session doesn't replay/re-grant copies that already
+    landed in an earlier process."""
+    progress = _load_config().get("filler_progress", {}).get(room_key, {})
+    return progress if isinstance(progress, dict) else {}
+
+
+def _save_filler_progress(room_key: str, progress: dict[str, int]) -> None:
+    config = _load_config()
+    all_progress = config.get("filler_progress", {})
+    if not isinstance(all_progress, dict):
+        all_progress = {}
+    all_progress[room_key] = progress
+    config["filler_progress"] = all_progress
     _save_config(config)
 
 
@@ -550,6 +616,7 @@ class NorthgardCommandProcessor(ClientCommandProcessor):
                 return False
             chosen = saves[int(choice)]
             _cleanup_stale_markers(ctx.pinned_save_path, chosen.path)
+            _clear_pending_resource_markers()  # an outstanding grant belonged to the save we're leaving, not this one
             ctx.pinned_save_path = chosen.path
             ctx.sent_chapters.clear()
             ctx.written_markers.clear()  # not received_chapters -- that's the slot's item history, unaffected by which local save we're pointed at
@@ -585,6 +652,18 @@ class NorthgardContext(CommonContext):
         self.written_markers: set[str] = set()  # Chapter-item names already marked unlocked on disk
         self.non_linear_mode: bool = False
         self.chapter7_requirement: int = 0  # Non-Linear Mode only -- see _sync_unlock_markers
+        # Index-aligned full receive history (not just a set). ReceivedItems packets carry a
+        # starting "index" and may resend the whole history from 0 on reconnect; keeping every
+        # entry at its real, stable index (rather than just accumulating a running count) means
+        # a resend can never double-count a filler/useful item the way a naive counter would.
+        # `None` entries are gaps not yet received (shouldn't normally happen, but a batch
+        # arriving out of order would otherwise leave a hole `list.append` can't represent).
+        self.received_item_names: list[str | None] = []
+        # RESOURCE_KINDS.key -> monotonic time.time() a filler marker for it was written and is
+        # still awaiting either the patched game consuming it or this client's own timeout.
+        # Absent entirely between grants (not e.g. 0.0) so "currently outstanding" is a plain
+        # membership check.
+        self.filler_marker_written_at: dict[str, float] = {}
         # _apply_room_pin fires on the very first "RoomInfo" packet, before the server's own
         # "Connected"/"X has joined" chat lines -- logging immediately there means the pin
         # status gets buried above all of that. Instead it's stashed here and printed on
@@ -620,38 +699,36 @@ class NorthgardContext(CommonContext):
         self.sent_chapters.clear()
         self.received_chapters.clear()
         self.written_markers.clear()
+        self.received_item_names.clear()  # a different room's ReceivedItems history is unrelated
+        self.filler_marker_written_at.clear()  # any in-flight filler grant belonged to the old room
+        _clear_pending_resource_markers()  # an outstanding grant on disk belonged to the old room, not this one
 
         pinned_filename = _load_pins().get(room_key)
         if not pinned_filename:
             self.pinned_save_path = None
-            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
             self._pending_pin_message = f"[Northgard] No conquest save pinned yet for this room ({room_key}) -- use /conquest to pick one."
-            return
-
-        if not NORTHGARD_SAVE_DIR:
+        elif not NORTHGARD_SAVE_DIR:
             self.pinned_save_path = None
-            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
             self._pending_pin_message = (
                 f"[Northgard] This room is pinned to {pinned_filename!r}, but no save folder is configured "
                 f"yet -- run /savedir, then /conquest to re-pick it."
             )
-            return
-
-        match = next((s for s in list_conquest_saves(NORTHGARD_SAVE_DIR) if s.filename == pinned_filename), None)
-        if match is not None:
-            self.pinned_save_path = match.path
-            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
-            self._pending_pin_message = (
-                f"[Northgard] Resuming this room's pinned save: {match.filename} "
-                f"({_clan_description(match.clan, match.partner_clan)}). Use /conquest to change it."
-            )
         else:
-            self.pinned_save_path = None
-            _cleanup_stale_markers(old_save_path, self.pinned_save_path)
-            self._pending_pin_message = (
-                f"[Northgard] This room was previously pinned to {pinned_filename!r}, but that save "
-                f"is no longer found. Use /conquest to pick one."
-            )
+            match = next((s for s in list_conquest_saves(NORTHGARD_SAVE_DIR) if s.filename == pinned_filename), None)
+            if match is not None:
+                self.pinned_save_path = match.path
+                self._pending_pin_message = (
+                    f"[Northgard] Resuming this room's pinned save: {match.filename} "
+                    f"({_clan_description(match.clan, match.partner_clan)}). Use /conquest to change it."
+                )
+            else:
+                self.pinned_save_path = None
+                self._pending_pin_message = (
+                    f"[Northgard] This room was previously pinned to {pinned_filename!r}, but that save "
+                    f"is no longer found. Use /conquest to pick one."
+                )
+
+        _cleanup_stale_markers(old_save_path, self.pinned_save_path)
 
     async def server_auth(self, password_requested: bool = False):
         if password_requested and not self.password:
@@ -685,10 +762,24 @@ class NorthgardContext(CommonContext):
             # written yet without knowing which save this room is pinned to (need that
             # save's own map to translate a Chapter name into the real in-game battle id it
             # randomized for this run) -- see _sync_unlock_markers, polled from save_watcher.
-            for entry in args.get("items", []):
+            #
+            # Also records every item at its real, packet-given index into
+            # received_item_names. Unlike received_chapters (a set, fine for "have we ever
+            # seen this Chapter" since a Chapter is only ever received once anyway), filler
+            # items can legitimately be received many times, so _sync_filler_grants needs an
+            # exact *count*, not just membership, and only an index-aligned resend, not a
+            # naively-incremented counter, survives a reconnect's full-history replay without
+            # double-counting.
+            start_index = args.get("index", 0)
+            items = args.get("items", [])
+            end_index = start_index + len(items)
+            if len(self.received_item_names) < end_index:
+                self.received_item_names.extend([None] * (end_index - len(self.received_item_names)))
+            for offset, entry in enumerate(items):
                 # entry is a NetUtils.NetworkItem (a NamedTuple), not a plain dict --
                 # attribute access, not .get().
                 name = _ID_TO_ITEM_NAME.get(entry.item)
+                self.received_item_names[start_index + offset] = name
                 if name in _ALL_CHAPTERS_SET:
                     self.received_chapters.add(name)
 
@@ -770,12 +861,96 @@ def _sync_unlock_markers(ctx: NorthgardContext, state: ConquestRunState) -> None
         _remove_unlock_marker(stray_infid)
 
 
+def _sync_filler_grants(ctx: NorthgardContext) -> None:
+    """Session-live filler resources (see RESOURCE_KINDS): for each kind, drains the gap
+    between how many copies have been received (ctx.received_item_names) and how many have
+    been *resolved*, meaning either actually granted in-game, or given up on after sitting
+    unconsumed too long (see _FILLER_MARKER_TIMEOUT_SECONDS's own comment for why that
+    still counts as resolved). Runs every poll tick regardless of whether a save is pinned.
+    Unlike Chapter unlocks/Useful items, filler doesn't need to know which save is running,
+    only that the patched game (if one is running at all) is watching
+    _PENDING_RESOURCES_DIR.
+
+    Only ever advances one marker at a time per resource kind (waits for the outstanding
+    one to resolve before writing the next). This is simpler than tracking multiple
+    in-flight markers per kind, and harmless: a backlog just drains one poll tick (or one
+    timeout) at a time, same as it would if the player were receiving them one at a time
+    anyway."""
+    room_key = _room_key(ctx)
+    if room_key is None:
+        return  # no room identity yet to scope persisted progress to, so try again next tick
+
+    progress = _load_filler_progress(room_key)
+    changed = False
+    now = time.time()
+    os.makedirs(_PENDING_RESOURCES_DIR, exist_ok=True)
+
+    for kind in RESOURCE_KINDS:
+        received = ctx.received_item_names.count(kind.filler_name)
+        resolved = progress.get(kind.key, 0)
+        marker_path = _resource_marker_path(kind.key, "filler")
+        written_at = ctx.filler_marker_written_at.get(kind.key)
+
+        if written_at is not None:
+            if not os.path.exists(marker_path):
+                # The patched game deleted it itself, so the grant actually landed.
+                progress[kind.key] = resolved + 1
+                changed = True
+                del ctx.filler_marker_written_at[kind.key]
+            elif now - written_at > _FILLER_MARKER_TIMEOUT_SECONDS:
+                # Nobody's been around (or this isn't the right save/session) to consume
+                # it, so forfeit it rather than let it queue up for later, per design.
+                try:
+                    os.remove(marker_path)
+                except OSError:
+                    pass
+                progress[kind.key] = resolved + 1
+                changed = True
+                del ctx.filler_marker_written_at[kind.key]
+        elif resolved < received:
+            if not os.path.exists(marker_path):
+                open(marker_path, "w", encoding="utf-8").close()
+            ctx.filler_marker_written_at[kind.key] = now
+
+    if changed:
+        _save_filler_progress(room_key, progress)
+
+
+def _sync_useful_grants(ctx: NorthgardContext) -> None:
+    """Permanent "<amount> Starting X" resources (see RESOURCE_KINDS): ensures each
+    already-received Useful item's marker exists on disk, once, ever. That's the client's
+    *entire* job now. The patched game no longer deletes a Useful marker after granting it
+    (ownership is permanent), and gates "apply exactly once per battle" itself, entirely
+    game-side, via a dedicated sentinel field it adds to `ResourcesComponent` per resource
+    key (`apUsefulApplied_<key>`, see patch_player_update_grants_resources), which is `false`
+    on every fresh battle instance regardless of *how* that instance came to exist.
+
+    This replaced an earlier design where this client tried to detect "a battle just started"
+    itself (via the save's `battleFocusId`, then via Chapter-completion as a proxy) and
+    rewrite the marker at that moment. Confirmed live, that could never cover quitting to
+    the Conquest map and re-entering the *same*, still-unwon battle (a fresh instance too, but
+    one no Chapter completion nor `battleFocusId` write is anywhere near), so it silently lost
+    the bonus. Moving the "once per instance" gate into the game itself removes any need for
+    this client to detect battle transitions of any kind, for any reason. It doesn't need to
+    know a save is even pinned to do this correctly, only that the item has been received."""
+    os.makedirs(_PENDING_RESOURCES_DIR, exist_ok=True)
+    for kind in RESOURCE_KINDS:
+        if ctx.received_item_names.count(kind.useful_name) == 0:
+            continue
+        marker_path = _resource_marker_path(kind.key, "useful")
+        if not os.path.exists(marker_path):
+            open(marker_path, "w", encoding="utf-8").close()
+
+
 async def save_watcher(ctx: NorthgardContext):
     while not ctx.exit_event.is_set():
         try:
             if ctx._pending_pin_message is not None:
                 logger.info(ctx._pending_pin_message)
                 ctx._pending_pin_message = None
+
+            _sync_filler_grants(ctx)  # doesn't need a pinned save; see its own docstring
+            _sync_useful_grants(ctx)  # doesn't need a pinned save either; see its own docstring
 
             if ctx.pinned_save_path is None:
                 pass

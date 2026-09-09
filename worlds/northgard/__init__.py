@@ -5,7 +5,7 @@ from worlds.AutoWorld import World, WebWorld
 from worlds.generic.Rules import set_rule
 from worlds.LauncherComponents import Component, Type, components, launch_subprocess, icon_paths
 
-from .Items import item_table, NorthgardItem, CHAPTER_ITEMS, FILLER_ITEM_NAME, VICTORY_ITEM_NAME
+from .Items import item_table, NorthgardItem, CHAPTER_ITEMS, FILLER_ITEM_NAMES, USEFUL_ITEM_NAMES, VICTORY_ITEM_NAME
 from .Locations import location_table, NorthgardLocation, VICTORY_LOCATION
 from .Regions import CHAPTERS, CHAPTER_CONNECTIONS, STARTING_CHAPTER, FINAL_CHAPTER
 from .Options import NorthgardOptions
@@ -128,10 +128,23 @@ class NorthgardWorld(World):
         self.multiworld.push_precollected(self.create_item(STARTING_CHAPTER))
 
         pool = [self.create_item(name) for name in CHAPTER_ITEMS if name != STARTING_CHAPTER]
-
         total_locations = len(self.multiworld.get_unfilled_locations(self.player))
+
+        # Up to one copy of each "<amount> Starting X" item, never more than one (see
+        # Items.py's own docstring), but not unconditionally guaranteed either. At the
+        # smallest "Items per Chapter" values there may not be room for all 7 on top of the
+        # mandatory Chapter-unlock items above, so this places as many as actually fit,
+        # chosen at random rather than always dropping the same ones.
+        useful_names = USEFUL_ITEM_NAMES
+        room_for_useful = max(0, total_locations - len(pool))
+        if room_for_useful < len(useful_names):
+            useful_names = self.multiworld.random.sample(useful_names, room_for_useful)
+        pool += [self.create_item(name) for name in useful_names]
+
+        # Cycles through every filler *kind* rather than repeating one, so the remaining slots
+        # end up a mix of Krowns/Food/Wood/etc instead of all-Krown.
         while len(pool) < total_locations:
-            pool.append(self.create_item(FILLER_ITEM_NAME))
+            pool.append(self.create_item(FILLER_ITEM_NAMES[len(pool) % len(FILLER_ITEM_NAMES)]))
 
         self.multiworld.itempool += pool
 
