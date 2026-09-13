@@ -45,6 +45,20 @@ import Utils
 from CommonClient import gui_enabled, logger, get_base_parser, CommonContext, ClientCommandProcessor, server_loop
 from NetUtils import ClientStatus
 
+# Universal Tracker (optional, player-installed apworld) -- if present, inheriting from its
+# TrackerGameContext instead of plain CommonContext gets this client a tracker tab and
+# in-logic location coloring for free, derived from this world's own create_regions/rules
+# rather than a separate poptracker pack. NorthgardContext.on_package's added
+# super().on_package(cmd, args) call below is what actually feeds it RoomInfo/Connected/
+# RoomUpdate. Falls back to plain CommonContext, no behavior change at all, when Universal
+# Tracker isn't installed -- this client never bundles or requires it.
+tracker_loaded = False
+try:
+    from worlds.tracker.TrackerClient import TrackerGameContext as SuperContext
+    tracker_loaded = True
+except ModuleNotFoundError:
+    from CommonClient import CommonContext as SuperContext
+
 from .Items import item_table as northgard_item_table, RESOURCE_KINDS
 from .Locations import location_table as northgard_location_table
 from .Regions import FINAL_CHAPTER
@@ -636,7 +650,7 @@ class NorthgardCommandProcessor(ClientCommandProcessor):
         return True
 
 
-class NorthgardContext(CommonContext):
+class NorthgardContext(SuperContext):
     game = "Northgard"
     items_handling = 0b111  # full remote: server is the source of truth for what we've received
     command_processor = NorthgardCommandProcessor
@@ -737,6 +751,11 @@ class NorthgardContext(CommonContext):
         await self.send_connect()
 
     def on_package(self, cmd: str, args: dict):
+        # Required for Universal Tracker (see SuperContext above): when it's installed,
+        # its own TrackerGameContext.on_package is what actually reruns generation and
+        # derives reachable locations on RoomInfo/Connected/RoomUpdate. A no-op when it
+        # isn't (plain CommonContext.on_package does nothing).
+        super().on_package(cmd, args)
         if cmd == "RoomInfo":
             self.seed_name = args.get("seed_name")
             self._apply_room_pin()
@@ -985,6 +1004,15 @@ async def main(args):
 
     ctx = NorthgardContext(args.connect, args.password)
     ctx.server_task = asyncio.create_task(server_loop(ctx), name="server loop")
+    # Per Universal Tracker's client integration guidelines: reruns this world's own
+    # generation logic standalone, off the connected slot's options, so the tracker tab can
+    # derive reachable locations without a separate poptracker pack. No-op (tracker_loaded
+    # is False) when Universal Tracker isn't installed.
+    if tracker_loaded and hasattr(ctx, "run_generator"):
+        try:
+            ctx.run_generator()
+        except Exception:
+            logger.exception("[Northgard] Universal Tracker run_generator failed")
     if gui_enabled:
         ctx.run_gui()
     ctx.run_cli()
