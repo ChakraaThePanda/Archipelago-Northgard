@@ -574,10 +574,9 @@ def _format_save_line(index: int, s: ConquestSaveSummary, pinned_filename: str |
 
 class NorthgardCommandProcessor(ClientCommandProcessor):
     def _cmd_savedir(self, path: str = "") -> bool:
-        """Show, pick, or set this machine's Northgard 'save' folder: /savedir with no
-        argument opens a folder-picker (or shows the current path if the picker isn't
-        available); /savedir <path> sets it directly. This is a per-machine setting, not
-        per-room -- set it once and every room reuses it."""
+        """Show or set this machine's Northgard save folder. No argument opens a folder
+        picker (or shows the current path); /savedir <path> sets it directly. This is a
+        per-machine setting, set once."""
         global NORTHGARD_SAVE_DIR
         path = path.strip().strip('"')
 
@@ -604,11 +603,9 @@ class NorthgardCommandProcessor(ClientCommandProcessor):
         return True
 
     def _cmd_conquest(self, choice: str = "") -> bool:
-        """List in-progress Conquest saves, or pin one by number: /conquest 2.
-        Required if you have more than one Conquest run going -- there's no way to
-        tell them apart automatically. The pin is remembered per-room, so running
-        multiple rooms at once (each in its own client window) keeps each one's
-        pinned save separate."""
+        """List in-progress Conquest saves, or pin one by number (e.g. /conquest 2).
+        Only needed if you have more than one Conquest run going. Pins are remembered
+        per room."""
         ctx: NorthgardContext = self.ctx
         if not NORTHGARD_SAVE_DIR:
             logger.info("[Northgard] No save folder configured yet -- run /savedir first.")
@@ -654,6 +651,17 @@ class NorthgardContext(SuperContext):
     game = "Northgard"
     items_handling = 0b111  # full remote: server is the source of truth for what we've received
     command_processor = NorthgardCommandProcessor
+    # When Universal Tracker is installed, SuperContext is its TrackerGameContext, which sets
+    # `tags = CommonContext.tags | {"Tracker"}` -- meant for a separate, passive tracker-only
+    # connection running alongside a real client. This client IS the real, playing connection
+    # (it sends genuine LocationChecks/StatusUpdate from save_watcher), just with UT's tab along
+    # for the ride, so it must never identify itself as a Tracker to the server: doing so makes
+    # the server silently reject those checks and the goal completion ("Trackers can't register
+    # new Location Checks" / "...Goal Complete"). Explicitly pinned back to CommonContext's own
+    # tags (harmless no-op when UT isn't installed, since SuperContext is already CommonContext
+    # there) rather than e.g. `SuperContext.tags - {"Tracker"}`, so it can't silently re-inherit
+    # "Tracker" (or any other UT-specific tag) if a future UT version adds more.
+    tags = CommonContext.tags
 
     def __init__(self, server_address, password):
         super().__init__(server_address, password)
