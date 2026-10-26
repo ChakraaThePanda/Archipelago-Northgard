@@ -89,6 +89,28 @@ const NON_LINEAR_FLAG_NAME: &str = "non_linear_mode.flag";
 // clans, and military XP is "HuntTrophy" for Lynx); addResource silently no-ops for
 // whichever alias isn't the current clan's own, so listing every known one is always safe.
 const PENDING_RESOURCES_SUBDIR: &str = "pending_resources";
+// Name prefix of the per-kind Filler sentinels patch_player_update_grants_resources adds to
+// ent.player.ResourcesComponent.
+const FILLER_SEEN_FIELD_PREFIX: &str = "apFillerSeen_";
+
+// Bump whenever any patch_* function's output changes. cmd_apply stamps it into the patched
+// bytecode's string table (unreferenced by any code, so the game never sees it), and
+// classify_battle_state reports any patched build without exactly this stamp as Outdated, so
+// the client's auto-heal re-applies it. Checking for a specific patched feature instead (as
+// an earlier version of this did) misses any later change that doesn't add a new one.
+// History: unstamped = everything up to the 2026.09.14 release; 2 = Filler grants reach every
+// human player in co-op.
+const PATCH_VERSION: u32 = 2;
+const PATCH_VERSION_STAMP_PREFIX: &str = "ArchipelagoNorthgardPatchVersion=";
+
+/// The PATCH_VERSION stamped into `code` by cmd_apply, or None if it has none (vanilla, or
+/// patched before stamps existed).
+fn patch_version_stamp(code: &Bytecode) -> Option<u32> {
+    code.strings
+        .iter()
+        .find_map(|s| s.strip_prefix(PATCH_VERSION_STAMP_PREFIX))
+        .and_then(|version| version.parse().ok())
+}
 
 /// One resource's whole live-grant configuration: its marker file basenames, its
 /// `_Data.ResourceKind` alias(es), and its two tunable amounts. Both marker names are fixed,
@@ -356,6 +378,7 @@ fn print_status_line(live_path: &Path) {
     match check_battle_state_patched(live_path) {
         Ok(PatchState::Vanilla) => println!("Status: NOT patched (getBattleState is vanilla)"),
         Ok(PatchState::Patched) => println!("Status: PATCHED (Chapter locks are enforced in-game)"),
+        Ok(PatchState::Outdated) => println!("Status: OUTDATED (patched by a different version, apply to update)"),
         Ok(PatchState::Unknown(reason)) => println!("Status: unknown ({reason})"),
         Err(e) => println!("Status: unknown (couldn't parse hlboot.dat: {e})"),
     }
@@ -622,6 +645,10 @@ fn cmd_natives(backup_path: &Path, live_path: &Path) -> Result<()> {
 enum PatchState {
     Vanilla,
     Patched,
+    /// Patched, but not stamped with this tool's own PATCH_VERSION (an older or newer build of
+    /// it). Treated like Vanilla by `status` so the client's auto-heal re-applies it; `apply`
+    /// already re-patches from the pristine backup.
+    Outdated,
     Unknown(String),
 }
 
@@ -637,7 +664,8 @@ fn classify_battle_state(code: &Bytecode) -> Result<PatchState> {
         .context("resolved findex vanished immediately after being found -- this should be impossible")?;
     Ok(match f.ops.len() {
         14 => PatchState::Vanilla,
-        31 => PatchState::Patched,
+        31 if patch_version_stamp(code) == Some(PATCH_VERSION) => PatchState::Patched,
+        31 => PatchState::Outdated,
         n => PatchState::Unknown(format!(
             "getBattleState has {n} ops -- neither the known vanilla (14) nor patched (31) shape"
         )),
@@ -665,6 +693,10 @@ fn cmd_status(live_path: &Path) -> Result<()> {
         }
         Ok(PatchState::Patched) => {
             println!("getBattleState has the Archipelago marker check installed -- currently patched.");
+        }
+        Ok(PatchState::Outdated) => {
+            println!("Patched by a different version of this tool. Run apply to update it.");
+            std::process::exit(1);
         }
         Ok(PatchState::Unknown(reason)) => {
             println!("Can't tell if patched: {reason} -- Northgard was likely updated; run 'apply' to re-verify/re-patch.");
@@ -812,6 +844,7 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
         });
     }
     patch_player_update_grants_resources(&mut code, &grants)?;
+    code.strings.push(format!("{PATCH_VERSION_STAMP_PREFIX}{PATCH_VERSION}").as_str().into());
 
     let mut serialized = Vec::new();
     code.serialize(&mut serialized).context("failed to serialize patched bytecode")?;
@@ -1009,8 +1042,13 @@ enum GrantKind {
     /// battle. Confirmed live that this was worth the extra fields: a single shared sentinel
     /// regressed exactly that case.
     Useful,
-    /// Applied once per marker, which IS deleted the instant it's granted. NorthgardClient.py
-    /// is solely responsible for ever writing another one.
+    /// Applied once per marker *per human player*, gated by this grant's own `key`-specific
+    /// "seen" sentinel (see add_bool_field). The game never deletes the marker: in a co-op
+    /// match every human player's update() has to see it, so deleting it on first sight gave
+    /// the whole grant to whichever human happened to update first (confirmed live: only the
+    /// host's clan ever got it, on both machines). NorthgardClient.py removes the marker after
+    /// a short hold instead, and each sentinel resets to false once its marker is gone, ready
+    /// for the next copy.
     Filler,
 }
 
@@ -1024,7 +1062,7 @@ enum GrantKind {
 /// just for the right one.
 struct ResourceGrant {
     kind: GrantKind,
-    key: &'static str, // matches RESOURCE_CONFIGS.key, used to name this grant's own sentinel field (Useful only)
+    key: &'static str, // matches RESOURCE_CONFIGS.key, used to name this grant's own sentinel field
     marker_path: String,
     resource_ids: &'static [&'static str],
     amount: f64,
@@ -1069,13 +1107,18 @@ fn add_bool_field(code: &mut Bytecode, class_name: &str, field_name: &str, bool_
 
 /// Patches `ent.Player.update(dt)`, which runs every simulation tick for every `ent.Player`
 /// instance that exists, human and AI alike, for as long as an actual match/battle is loaded,
-/// so that the *human* player additionally checks each of `grants`' marker-file paths every
-/// tick and, for any that exist, grants the corresponding resource(s). `NorthgardClient.py` is
-/// what creates these markers; this tool never touches them itself. The two grant kinds
-/// (`GrantKind`) behave differently once granted:
-///   - Filler items (e.g. "100 Food"): the marker is deleted the instant it's granted, so it
-///     can't be re-applied next tick. NorthgardClient.py deletes it itself if it goes
-///     unconsumed too long instead (deliberately session-live, not queued for later).
+/// so that every *human* player (all of them in a co-op match, not just the local one)
+/// additionally checks each of `grants`' marker-file paths every tick and, for any that exist,
+/// grants the corresponding resource(s). Every machine in a co-op match runs its own client and
+/// gets the same markers, so every machine ends up granting the same thing to every human
+/// player. `NorthgardClient.py` is what creates and removes these markers; this tool never
+/// touches them itself. The two grant kinds (`GrantKind`) behave differently once granted:
+///   - Filler items (e.g. "100 Food"): granted once per marker per human player, gated by a
+///     per-kind "seen" sentinel (`apFillerSeen_<key>`, via add_bool_field) that is set when
+///     granted and reset to false on any tick the marker doesn't exist. The marker is never
+///     deleted here: NorthgardClient.py removes it after a short hold (deliberately
+///     session-live, not queued for later), which is what re-arms the sentinel for the next
+///     copy.
 ///   - Useful items (e.g. "50 Starting Food"): the marker is NEVER deleted. It represents
 ///     permanent ownership, and NorthgardClient.py only ever needs to write it once, the first
 ///     time the item is received. Instead, applying it exactly once per *battle* (not once
@@ -1121,7 +1164,6 @@ fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceG
     let update_findex = find_method_findex(code, "ent.Player", "update")?;
     let get_path_findex = find_method_findex(code, "$Sys", "getPath")?;
     let sys_exists_findex = find_native_findex(code, "std", "sys_exists")?;
-    let sys_delete_findex = find_native_findex(code, "std", "sys_delete")?;
     let add_resource_findex = find_method_findex(code, "ent.player.ResourcesComponent", "addResource")?;
     let (res_field, res_ty) = find_field_by_name(code, "ent.Player", "res")?;
 
@@ -1194,6 +1236,13 @@ fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceG
         let field = add_bool_field(code, "ent.player.ResourcesComponent", &field_name, bool_ty)?;
         sentinel_fields.push((grant.key, field));
     }
+    // Same idea for Filler, one per kind, kept in their own list since both kinds share keys.
+    let mut filler_seen_fields: Vec<(&'static str, RefField)> = Vec::new();
+    for grant in grants.iter().filter(|g| g.kind == GrantKind::Filler) {
+        let field_name = format!("{FILLER_SEEN_FIELD_PREFIX}{}", grant.key);
+        let field = add_bool_field(code, "ent.player.ResourcesComponent", &field_name, bool_ty)?;
+        filler_seen_fields.push((grant.key, field));
+    }
 
     // Fetched, validated, and updated in its own scope, separate from the rest of this
     // function, which needs to freely push onto code.strings/code.ints/code.floats while
@@ -1245,9 +1294,9 @@ fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceG
         f.regs.push(reason_ty); // base+10 r_reason (always null)
         f.regs.push(res_ty); // base+11 r_res (this.res)
         f.regs.push(bool_ty); // base+12 r_grant_result
-        f.regs.push(bool_ty); // base+13 r_delete_result
-        f.regs.push(bool_ty); // base+14 r_sentinel: holds whichever Useful grant's own sentinel is currently being checked
-        f.regs.push(bool_ty); // base+15 r_true: constant, written into a sentinel once its grant is applied
+        f.regs.push(bool_ty); // base+13 r_sentinel: holds whichever grant's own sentinel is currently being checked
+        f.regs.push(bool_ty); // base+14 r_true: constant, written into a sentinel once its grant is applied
+        f.regs.push(bool_ty); // base+15 r_false: constant, written into a Filler sentinel once its marker is gone
         // Every grant slot, and every resource-id alias within one grant, reuses these same
         // registers. Each use's liveness ends before the next one starts, so nothing needs to
         // be preserved across them, and there is no need for a fresh set of registers per
@@ -1269,9 +1318,9 @@ fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceG
     let r_reason = Reg(base + 10);
     let r_res = Reg(base + 11);
     let r_grant_result = Reg(base + 12);
-    let r_delete_result = Reg(base + 13);
-    let r_sentinel = Reg(base + 14);
-    let r_true = Reg(base + 15);
+    let r_sentinel = Reg(base + 13);
+    let r_true = Reg(base + 14);
+    let r_false = Reg(base + 15);
 
     use Opcode::*;
     const ALIAS_LEN: i32 = 9; // ops per resource-id alias granted within a slot
@@ -1321,10 +1370,12 @@ fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceG
         Ok(())
     };
 
-    // One Filler grant slot: check its marker, and if present, grant every resource-id alias
-    // and delete the marker. `code` is an explicit parameter for the same reason as
-    // push_aliases above.
-    let push_filler_slot = |code: &mut Bytecode, prelude: &mut Vec<Opcode>, grant: &ResourceGrant| -> Result<()> {
+    // One Filler grant slot, run by every human player: if the marker exists and this player's
+    // own "seen" sentinel is still false, grant every resource-id alias and set the sentinel;
+    // if the marker doesn't exist, reset the sentinel so the next copy gets granted again. The
+    // marker itself is never deleted here (see GrantKind::Filler). `code` is an explicit
+    // parameter for the same reason as push_aliases above.
+    let push_filler_slot = |code: &mut Bytecode, prelude: &mut Vec<Opcode>, grant: &ResourceGrant, seen_field: RefField| -> Result<()> {
         let marker_ref = RefString(code.strings.len());
         code.strings.push(grant.marker_path.as_str().into());
         let marker_len_ref = RefInt(code.ints.len());
@@ -1340,14 +1391,29 @@ fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceG
             Call1 { dst: r_exists, fun: RefFun(sys_exists_findex), arg0: r_marker_path },
         ]);
         let jfalse_index = prelude.len();
-        prelude.push(JFalse { cond: r_exists, offset: 0 }); // patched in below, once this slot's real end is known
+        prelude.push(JFalse { cond: r_exists, offset: 0 }); // patched below: marker gone -> reset branch
         prelude.push(GetThis { dst: r_res, field: res_field });
+        prelude.push(Field { dst: r_sentinel, obj: r_res, field: seen_field });
+        let jtrue_index = prelude.len();
+        prelude.push(JTrue { cond: r_sentinel, offset: 0 }); // patched below: already granted this copy -> slot end
 
         push_aliases(code, prelude, grant)?;
-        prelude.push(Call1 { dst: r_delete_result, fun: RefFun(sys_delete_findex), arg0: r_marker_path });
+
+        prelude.push(GetThis { dst: r_res, field: res_field });
+        prelude.push(Bool { dst: r_true, value: true });
+        prelude.push(SetField { obj: r_res, field: seen_field, src: r_true });
+        let jalways_index = prelude.len();
+        prelude.push(JAlways { offset: 0 }); // patched below: skip the reset branch
+
+        let reset_start = prelude.len();
+        prelude.push(GetThis { dst: r_res, field: res_field });
+        prelude.push(Bool { dst: r_false, value: false });
+        prelude.push(SetField { obj: r_res, field: seen_field, src: r_false });
 
         let slot_end = prelude.len();
-        prelude[jfalse_index] = JFalse { cond: r_exists, offset: (slot_end - jfalse_index - 1) as i32 };
+        prelude[jfalse_index] = JFalse { cond: r_exists, offset: (reset_start - jfalse_index - 1) as i32 };
+        prelude[jtrue_index] = JTrue { cond: r_sentinel, offset: (slot_end - jtrue_index - 1) as i32 };
+        prelude[jalways_index] = JAlways { offset: (slot_end - jalways_index - 1) as i32 };
         Ok(())
     };
 
@@ -1411,10 +1477,14 @@ fn patch_player_update_grants_resources(code: &mut Bytecode, grants: &[ResourceG
         prelude[jfalse_index] = JFalse { cond: r_exists, offset: (slot_end - jfalse_index - 1) as i32 };
     }
 
-    // Filler grants: unchanged from before. Checked and deleted every tick, independent of
+    // Filler grants: checked every tick, each gated by its own "seen" sentinel, independent of
     // any Useful sentinel.
     for grant in grants.iter().filter(|g| g.kind == GrantKind::Filler) {
-        push_filler_slot(code, &mut prelude, grant)?;
+        let (_, seen_field) = *filler_seen_fields
+            .iter()
+            .find(|(key, _)| *key == grant.key)
+            .context("internal error: a Filler grant's sentinel field was not registered above")?;
+        push_filler_slot(code, &mut prelude, grant, seen_field)?;
     }
 
     let prelude_len_before_body = prelude.len();
