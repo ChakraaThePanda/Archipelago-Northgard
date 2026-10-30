@@ -1,9 +1,11 @@
-# Posts each published release to the project's Discord channel as an embed.
+# Posts new commits and published releases to the project's Discord channel as embeds.
 # Needs a DISCORD_WEBHOOK repository secret (the channel's webhook URL); skips without it.
 # Run it manually to re-post the latest release, or a specific one by tag.
-name: Discord release post
+name: Discord posts
 
 on:
+  push:
+    branches: [main, master]
   release:
     types: [published]
   workflow_dispatch:
@@ -15,18 +17,65 @@ on:
 permissions:
   contents: read
 
+env:
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+  # Dates in the footer are written in this time zone (runners default to UTC)
+  TZ: America/Toronto
+
 jobs:
-  post:
+  commits:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post commits to Discord
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK secret is not set, skipping"
+            exit 0
+          fi
+          if [ "$(jq '.commits | length' "$GITHUB_EVENT_PATH")" = 0 ]; then
+            echo "No new commits in this push, skipping"
+            exit 0
+          fi
+          footer="$(date -d "$(jq -r '.head_commit.timestamp' "$GITHUB_EVENT_PATH")" '+%Y/%m/%d - %H:%M')"
+          jq --arg footer "$footer" '
+            .repository.name as $repo
+            | (.ref | sub("^refs/heads/"; "")) as $branch
+            | .commits as $commits
+            | (if ($commits | length) == 1
+              then
+                ($commits[0].message | gsub("\r"; "") | split("\n")) as $lines
+                | ($lines[1:] | join("\n") | sub("^\\s+"; "") | sub("\\s+$"; "")) as $body
+                | {
+                    title: $lines[0],
+                    url: $commits[0].url,
+                    description: ("-# New commit · \($repo)/\($branch) · `\($commits[0].id[0:7])`"
+                      + (if $body == "" then "" else "\n" + $body[0:3500] end))
+                  }
+              else
+                {
+                  title: "\($commits | length) new commits",
+                  url: .compare,
+                  description: ("-# Pushed to \($repo)/\($branch)\n"
+                    + ([$commits[] | "[`\(.id[0:7])`](\(.url)) \(.message | split("\n")[0])"] | join("\n")))
+                }
+              end) as $content
+            | {embeds: [$content + {
+                color: 1752220,
+                author: {name: .sender.login, url: .sender.html_url, icon_url: .sender.avatar_url},
+                footer: {text: $footer}
+              }]}' "$GITHUB_EVENT_PATH" > payload.json
+          curl -sSf -H "Content-Type: application/json" --data-binary @payload.json "$DISCORD_WEBHOOK"
+
+  release:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Post release to Discord
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ github.event.release.id }}
           TAG: ${{ inputs.tag }}
-          # The footer date is written in this time zone (runners default to UTC)
-          TZ: America/Toronto
         run: |
           if [ -z "$DISCORD_WEBHOOK" ]; then
             echo "DISCORD_WEBHOOK secret is not set, skipping"
@@ -61,6 +110,6 @@ jobs:
                   + (if $compare
                     then [{name: "Full Changelog", value: "[\($compare | split("/") | last)](\($compare))"}]
                     else [] end)),
-                footer: {text: (.published_at | fromdate | strflocaltime("%Y-%m-%d"))}
+                footer: {text: (.published_at | fromdate | strflocaltime("%Y/%m/%d - %H:%M"))}
               }]}' > payload.json
           curl -sSf -H "Content-Type: application/json" --data-binary @payload.json "$DISCORD_WEBHOOK"
