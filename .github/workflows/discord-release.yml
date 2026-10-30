@@ -1,0 +1,56 @@
+# Posts each published release to the project's Discord channel as an embed.
+# Needs a DISCORD_WEBHOOK repository secret (the channel's webhook URL); skips without it.
+# Run it manually to re-post the latest release, or a specific one by tag.
+name: Discord release post
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to post (leave empty for the latest release)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post release to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK secret is not set, skipping"
+            exit 0
+          fi
+          if [ -n "$RELEASE_ID" ]; then
+            release="releases/$RELEASE_ID"
+          elif [ -n "$TAG" ]; then
+            release="releases/tags/$TAG"
+          else
+            release="releases/latest"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/$release" --jq '
+            (.html_url | split("/")[4]) as $repo
+            | ((.body // "") | gsub("\r"; "") | split("**Full Changelog**")[0] | sub("\\s+$"; "")) as $notes
+            | {embeds: [{
+                title: "[\($repo)] New \(if .prerelease then "pre-release" else "release" end) published: \(.name // .tag_name)",
+                url: .html_url,
+                description: (if ($notes | length) > 3500
+                  then ($notes[0:3500] + "...\n\n[Read the full notes](\(.html_url))")
+                  else $notes end),
+                color: 5793266,
+                author: {name: .author.login, url: .author.html_url, icon_url: .author.avatar_url},
+                fields: (if (.assets | length) > 0
+                  then [{name: "Downloads", value: ([.assets[] | "[\(.name)](\(.browser_download_url))"] | join("\n"))}]
+                  else [] end),
+                timestamp: .published_at
+              }]}' > payload.json
+          curl -sSf -H "Content-Type: application/json" --data-binary @payload.json "$DISCORD_WEBHOOK"
