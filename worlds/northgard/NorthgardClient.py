@@ -63,6 +63,7 @@ except ModuleNotFoundError:
 from .Items import item_table as northgard_item_table, RESOURCE_KINDS
 from .Locations import location_table as northgard_location_table
 from .Regions import FINAL_CHAPTER
+from . import bifrost_client
 from .save_state import (
     list_conquest_saves, read_conquest_run_state, infid_in_map, all_infids,
     CHAPTER_ROWS, ConquestRunState, ConquestSaveSummary,
@@ -79,7 +80,8 @@ _ID_TO_ITEM_NAME: dict[int, str] = {data.code: name for name, data in northgard_
 # somewhere different, so it's never safe to hardcode. Empty string means "not configured
 # yet"; every reader below has to tolerate that instead of assuming a real path.
 NORTHGARD_SAVE_DIR: str = ""
-POLL_INTERVAL_SECONDS = 5.0
+# Every mode's poll: save diffs (Conquest), done markers (Bifrost), resource marker upkeep.
+POLL_INTERVAL_SECONDS = 1.0
 
 
 def _known_folder_path(guid_str: str, fallback: str) -> str:
@@ -174,11 +176,13 @@ _PENDING_RESOURCES_DIR = os.path.join(_CONFIG_DIR, "pending_resources")
 
 # How long a filler marker stays on disk before this client deletes it and counts that copy as
 # "resolved" (whether a match was running to grant it or not, so a reconnect never retries it).
-# Every human player's update() checks it every simulation tick, so a single poll tick is already
-# hundreds of chances to see it. The marker is only deleted on a later tick, and the next copy
-# only written on the tick after that, so there's always at least one poll tick with no marker,
-# which is what resets each player's sentinel for the next copy.
-_FILLER_MARKER_HOLD_SECONDS = POLL_INTERVAL_SECONDS
+# Every human player's update() checks it every simulation tick, so this is many chances for every
+# co-op player's game to see it. Deliberately its own fixed value, NOT tied to the (much faster)
+# poll interval: it's what gives every machine in a co-op match time to grant the copy. The marker
+# is only deleted on a later poll, and the next copy only written on the poll after that, so
+# there's always at least one poll with no marker, which is what resets each player's sentinel for
+# the next copy.
+_FILLER_MARKER_HOLD_SECONDS = 5.0
 
 
 def _resource_marker_path(key: str, grant_kind: str) -> str:
@@ -597,6 +601,18 @@ def _format_save_line(index: int, s: ConquestSaveSummary, pinned_filename: str |
 
 
 class NorthgardCommandProcessor(ClientCommandProcessor):
+    def _cmd_bifrost(self) -> bool:
+        """Bifrost mode: show each realm's lock state, locations left, AP card positions on
+        each perk screen, and owned bonus items."""
+        ctx: NorthgardContext = self.ctx
+        if ctx.game_mode != "bifrost":
+            logger.info("[Northgard] This slot isn't a Bifrost-mode slot.")
+            return False
+        logger.info("[Northgard] Bifrost status for this slot:")
+        for line in bifrost_client.describe(ctx):
+            logger.info(line)
+        return True
+
     def _cmd_savedir(self, path: str = "") -> bool:
         """Show or set this machine's Northgard save folder. No argument opens a folder
         picker (or shows the current path); /savedir <path> sets it directly. This is a
@@ -696,6 +712,11 @@ class NorthgardContext(SuperContext):
         self.received_chapters: set[str] = set()  # Chapter-item names received this room
         self.written_markers: set[str] = set()  # Chapter-item names already marked unlocked on disk
         self.non_linear_mode: bool = False
+        self.game_mode: str = "conquest"  # overwritten from slot_data on connect
+        self.bifrost_perk_setting: int = 1  # ap_perk_cards, Bifrost only
+        # Bifrost: location id -> the NetworkItem it holds, for AP card tooltips (LocationInfo).
+        self.bifrost_scouts: dict = {}
+        self.bifrost_scouted: bool = False  # scouted this connection yet
         self.chapter7_requirement: int = 0  # Non-Linear Mode only -- see _sync_unlock_markers
         # Index-aligned full receive history (not just a set). ReceivedItems packets carry a
         # starting "index" and may resend the whole history from 0 on reconnect; keeping every
@@ -714,6 +735,7 @@ class NorthgardContext(SuperContext):
         # status gets buried above all of that. Instead it's stashed here and printed on
         # save_watcher's first poll tick, comfortably after the connection noise has settled.
         self._pending_pin_message: str | None = None
+        self._warned_missing_save: str | None = None  # see save_watcher
 
     def make_gui(self):
         ui = super().make_gui()
@@ -748,6 +770,10 @@ class NorthgardContext(SuperContext):
         self.received_item_names.clear()  # a different room's ReceivedItems history is unrelated
         self.filler_marker_written_at.clear()  # any in-flight filler grant belonged to the old room
         _clear_pending_resource_markers()  # an outstanding grant on disk belonged to the old room, not this one
+        bifrost_client.clear_state_markers(_CONFIG_DIR)  # rewritten from this slot's own state on the next poll
+        self.bifrost_scouts.clear()  # scouted items belong to the previous slot
+        self.bifrost_scouted = False
+        bifrost_client.switch_granted_records(_CONFIG_DIR, room_key)  # this seed:slot's own bonus records
 
         pinned_filename = _load_pins().get(room_key)
         if not pinned_filename:
@@ -795,6 +821,15 @@ class NorthgardContext(SuperContext):
             # and CommonContext only sets self.team/self.slot from this packet.
             self._apply_room_pin()
             slot_data = args.get("slot_data", {})
+            self.game_mode = slot_data.get("game_mode", "conquest")
+            self.bifrost_perk_setting = slot_data.get("ap_perk_cards", 1)
+            bifrost_client.set_active(_CONFIG_DIR, self.game_mode == "bifrost")
+            self.bifrost_scouted = False
+            if self.game_mode == "bifrost":
+                bifrost_client.write_card_icon(_CONFIG_DIR)
+            if self.game_mode == "bifrost":
+                # Bifrost needs no save pin: the patched game acts on whatever run is loaded.
+                self._pending_pin_message = "[Northgard] Bifrost mode. Use /bifrost to see what's left."
             self.amount_of_locations = slot_data.get("amount_of_locations", 4)
             self.non_linear_mode = bool(slot_data.get("non_linear_mode", False))
             self.chapter7_requirement = slot_data.get("chapter7_requirement", 0)
@@ -806,6 +841,15 @@ class NorthgardContext(SuperContext):
             # non-blocking acquire is what actually guarantees mutual exclusion.
             if not _patch_check_lock.locked():
                 threading.Thread(target=_ensure_game_patched, daemon=True).start()
+        elif cmd == "LocationInfo":
+            # Scouted AP card items (see _bifrost_tick): tooltip text for the patched perk screen.
+            for item in args.get("locations", []):
+                self.bifrost_scouts[item.location] = item
+            if self.game_mode == "bifrost" and _room_key(self) is not None:
+                try:
+                    bifrost_client.sync_markers(self, _CONFIG_DIR)
+                except OSError:
+                    logger.exception("[Northgard] Couldn't write Bifrost tooltip files")
         elif cmd == "ReceivedItems":
             # Applies a received "Chapter N [- Top/Bottom]" item back to Northgard so that
             # node becomes actually selectable in-game (enforced by the patched game binary
@@ -835,6 +879,22 @@ class NorthgardContext(SuperContext):
                 self.received_item_names[start_index + offset] = name
                 if name in _ALL_CHAPTERS_SET:
                     self.received_chapters.add(name)
+            # Hand new items to the game right away instead of on the next poll: resources (both
+            # modes), Chapter unlocks (Conquest) and realm/bonus items (Bifrost).
+            self.apply_items_now()
+
+    def apply_items_now(self) -> None:
+        if _room_key(self) is None:
+            return
+        try:
+            _sync_useful_grants(self)
+            _sync_filler_grants(self)
+            if self.game_mode == "bifrost":
+                bifrost_client.sync_markers(self, _CONFIG_DIR)
+            elif self.pinned_save_path and os.path.exists(self.pinned_save_path):
+                _sync_unlock_markers(self, read_conquest_run_state(self.pinned_save_path))
+        except Exception:
+            logger.exception("[Northgard] Couldn't apply received items right away (retried next poll)")
 
     def location_ids_for_chapter(self, chapter_name: str) -> list[int]:
         ids = []
@@ -995,6 +1055,38 @@ def _sync_useful_grants(ctx: NorthgardContext) -> None:
             open(marker_path, "w", encoding="utf-8").close()
 
 
+async def _bifrost_tick(ctx: NorthgardContext) -> None:
+    """Bifrost mode's whole poll: markers out, done markers in. See bifrost_client.py."""
+    if _room_key(ctx) is None:
+        return  # no slot yet: never write one slot's state or send its checks for another
+    if not ctx.bifrost_scouted:
+        # Every unchecked AP card's item, once per connection, for the perk screen tooltips.
+        card_ids = bifrost_client.card_location_ids(ctx)
+        if card_ids:
+            await ctx.send_msgs([{"cmd": "LocationScouts", "locations": card_ids, "create_as_hint": 0}])
+        ctx.bifrost_scouted = True
+    bifrost_client.sync_markers(ctx, _CONFIG_DIR)
+    names = bifrost_client.collect_done(_CONFIG_DIR)
+    if not names:
+        return
+    seen = [i for i in bifrost_client.resolve_seen(names) if i in set(ctx.missing_locations)]
+    if seen:
+        # AP cards just shown on a perk screen: hint their items (2 = only new hints, no cost).
+        await ctx.send_msgs([{"cmd": "LocationScouts", "locations": seen, "create_as_hint": 2}])
+    ids, goal, unknown = bifrost_client.resolve_done(names)
+    own = set(ctx.missing_locations) | set(ctx.checked_locations)
+    ids = [i for i in ids if i in own]  # locations this slot actually has (perk setting)
+    if ids:
+        await ctx.send_msgs([{"cmd": "LocationChecks", "locations": ids}])
+    if goal and not ctx.finished_game:
+        ctx.finished_game = True
+        await ctx.send_msgs([{"cmd": "StatusUpdate", "status": ClientStatus.CLIENT_GOAL}])
+        logger.info("[Northgard] Vanaheim completed. Goal sent!")
+    if unknown:
+        logger.debug(f"[Northgard] Ignored Bifrost markers with no matching location: {unknown}")
+    bifrost_client.remove_done(_CONFIG_DIR, names)
+
+
 async def save_watcher(ctx: NorthgardContext):
     while not ctx.exit_event.is_set():
         try:
@@ -1005,10 +1097,15 @@ async def save_watcher(ctx: NorthgardContext):
             _sync_filler_grants(ctx)  # doesn't need a pinned save; see its own docstring
             _sync_useful_grants(ctx)  # doesn't need a pinned save either; see its own docstring
 
-            if ctx.pinned_save_path is None:
+            if ctx.game_mode == "bifrost":
+                await _bifrost_tick(ctx)
+            elif ctx.pinned_save_path is None:
                 pass
             elif not os.path.exists(ctx.pinned_save_path):
-                logger.warning(f"[Northgard] Pinned save no longer found: {ctx.pinned_save_path}. Run /conquest again.")
+                # Once per save, not every (1 second) poll.
+                if ctx._warned_missing_save != ctx.pinned_save_path:
+                    ctx._warned_missing_save = ctx.pinned_save_path
+                    logger.warning(f"[Northgard] Pinned save no longer found: {ctx.pinned_save_path}. Run /conquest again.")
             else:
                 state = read_conquest_run_state(ctx.pinned_save_path)
                 _sync_unlock_markers(ctx, state)

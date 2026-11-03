@@ -31,3 +31,11 @@ for _chapter in CHAPTERS:
         _next_id += 1
 
 VICTORY_LOCATION = "Chapter 07 - Victory"
+
+# --- Bifrost mode (game_mode: bifrost) ---------------------------------------------------
+# Every possible Bifrost location, pre-declared in Bifrost.py's fixed order so ids stay
+# stable whatever the ap_perk_cards setting is.
+from .Bifrost import BIFROST_LOCATION_BASE, BIFROST_LOCATIONS  # noqa: E402
+
+for _i, _loc in enumerate(BIFROST_LOCATIONS):
+    location_table[_loc.name] = LocationData(BIFROST_LOCATION_BASE + _i)

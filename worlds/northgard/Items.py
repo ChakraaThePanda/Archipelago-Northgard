@@ -106,3 +106,15 @@ for i, name in enumerate(USEFUL_ITEM_NAMES):
 # The event item awarded for beating Chapter 07 -- never placed in the pool, never sent
 # over the network; it only exists so multiworld.completion_condition has something to check.
 VICTORY_ITEM_NAME = "Victory"
+
+# --- Bifrost mode (game_mode: bifrost) ---------------------------------------------------
+# Realm unlocks and category bonus items. Ids live in their own block (Bifrost.py's
+# BIFROST_ITEM_BASE) so they can never collide with Conquest's. Resource items above are
+# shared by both modes.
+from .Bifrost import BIFROST_ITEM_BASE, REALM_ITEMS, BONUS_ITEMS  # noqa: E402
+
+for _i, _name in enumerate(REALM_ITEMS):
+    item_table[_name] = ItemData(BIFROST_ITEM_BASE + _i, ItemClassification.progression)
+# Bonus items make runs easier but never gate anything: only realm items do.
+for _i, _name in enumerate(BONUS_ITEMS):
+    item_table[_name] = ItemData(BIFROST_ITEM_BASE + 100 + _i, ItemClassification.useful)

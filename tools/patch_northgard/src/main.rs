@@ -30,6 +30,8 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+mod bifrost;
+
 // NOTE: findices themselves are no longer hardcoded here -- see find_method_findex /
 // find_native_findex below. Northgard renumbers its whole function table on every
 // recompile (confirmed: this is exactly what silently broke Chapter-lock enforcement
@@ -99,8 +101,20 @@ const FILLER_SEEN_FIELD_PREFIX: &str = "apFillerSeen_";
 // the client's auto-heal re-applies it. Checking for a specific patched feature instead (as
 // an earlier version of this did) misses any later change that doesn't add a new one.
 // History: unstamped = everything up to the 2026.09.14 release; 2 = Filler grants reach every
-// human player in co-op.
-const PATCH_VERSION: u32 = 2;
+// human player in co-op; 3 = Bifrost mode patches; 4 = Bifrost card numbering by cards per
+// player, bonus items written to every machine's run save with per-run granted records; 5 =
+// random unowned pick for fixed bonus categories, pool-category debug readout; 6 = run key is
+// startSeed, records hold the granted id (re-grant after reload), pool match via string_compare; 7 = startSeed unwrapped before
+// it's turned into the run key; 8 = regrouped bonus categories, random pool picks, Building
+// Unlock items; 9 = pool-category fallback across co-op players, AP cards tinted on perk screens; 10 = AP cards show
+// the Archipelago logo and the scouted item as their tooltip (no tint); 11 = logo drawn in the
+// card's backIcon slot with every other art layer hidden; 12 = logo replaces the card's `back`
+// background instead, all four art layers hidden (same look for every card kind); 13 = wave card
+// positions counted across the whole screen (6 locations per wave screen); 14 = Building Unlock
+// only picks buildings vanilla Bifrost can offer (bifrostSelectionWeight > 0); 15 = /debugreward
+// testing aid (objective reward screens on demand); 16 = debug reward screens use the game's own
+// choice-type constants; 17 = testing aids (/debugwave, /debugreward hook) removed.
+const PATCH_VERSION: u32 = 17;
 const PATCH_VERSION_STAMP_PREFIX: &str = "ArchipelagoNorthgardPatchVersion=";
 
 /// The PATCH_VERSION stamped into `code` by cmd_apply, or None if it has none (vanilla, or
@@ -326,6 +340,7 @@ fn main() -> Result<()> {
             cmd_whois(&backup_path, &live_path, findex)
         }
         "natives" => cmd_natives(&backup_path, &live_path),
+        "verify" => cmd_verify(&live_path),
         "listfields" => {
             let class_name = args.get(3).context("usage: patch_northgard listfields <dir> <class>")?;
             cmd_list_fields(&backup_path, &live_path, class_name)
@@ -618,6 +633,58 @@ fn cmd_whois(backup_path: &Path, live_path: &Path, target_findex: usize) -> Resu
     Ok(())
 }
 
+/// Diagnostic: structural sanity check of the LIVE hlboot.dat (not the backup). Every jump in
+/// every function must land inside the function, and every backward jump must land on a
+/// `Label` op, which HashLink requires for loops. Also re-serializes to make sure the file
+/// round-trips. Exit 0 = clean.
+fn cmd_verify(live_path: &Path) -> Result<()> {
+    let path_str = live_path.to_str().context("path isn't valid UTF-8")?;
+    let code = Bytecode::from_file(path_str).context("failed to parse hlboot.dat")?;
+    let mut problems = 0;
+    for f in &code.functions {
+        let n = f.ops.len() as i64;
+        if let Some(d) = &f.debug_info {
+            if d.len() != f.ops.len() {
+                println!("findex={} debug_info has {} entries for {} ops", f.findex.0, d.len(), f.ops.len());
+                problems += 1;
+            }
+        }
+        for (i, op) in f.ops.iter().enumerate() {
+            if let Some(off) = bifrost::jump_offset(op).map(i64::from) {
+                let target = i as i64 + 1 + off;
+                if target < 0 || target >= n {
+                    println!("findex={} op{i}: jump to {target} is outside 0..{n}", f.findex.0);
+                    problems += 1;
+                } else if off < 0 && !matches!(f.ops[target as usize], Opcode::Label) {
+                    println!("findex={} op{i}: backward jump to {target}, which is not a Label", f.findex.0);
+                    problems += 1;
+                }
+            }
+            let regs = f.regs.len() as u32;
+            let text = format!("{op:?}");
+            if text.contains("Function {") {
+                continue; // closures print their nested function's registers too
+            }
+            let bad_reg = text
+                .split("Reg(")
+                .skip(1)
+                .filter_map(|s| s.split(')').next()?.parse::<u32>().ok())
+                .find(|r| *r >= regs);
+            if let Some(r) = bad_reg {
+                println!("findex={} op{i}: uses reg{r} but the function has {regs} regs", f.findex.0);
+                problems += 1;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    code.serialize(&mut out).context("re-serialization failed")?;
+    println!("checked {} functions, {problems} problem(s), re-serialized {} bytes", code.functions.len(), out.len());
+    if problems > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn cmd_natives(backup_path: &Path, live_path: &Path) -> Result<()> {
     // Diagnostic: every native (lib.name@findex), for verifying find_native_findex's inputs.
     let source = if backup_path.exists() { backup_path } else { live_path };
@@ -844,6 +911,13 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
         });
     }
     patch_player_update_grants_resources(&mut code, &grants)?;
+
+    let bifrost_dir = config_dir.join(bifrost::BIFROST_SUBDIR);
+    let done_dir = bifrost_dir.join(bifrost::DONE_SUBDIR);
+    fs::create_dir_all(&done_dir).context("failed to create the Bifrost marker directories")?;
+    let env = bifrost::Env::new(&code, bifrost_dir.display().to_string(), done_dir.display().to_string())?;
+    bifrost::apply_all(&mut code, &env)?;
+
     code.strings.push(format!("{PATCH_VERSION_STAMP_PREFIX}{PATCH_VERSION}").as_str().into());
 
     let mut serialized = Vec::new();
@@ -854,6 +928,7 @@ fn cmd_apply(live_path: &Path, backup_path: &Path) -> Result<()> {
     println!("Marker directory: {unlock_dir_display}", unlock_dir_display = unlock_dir.display());
     println!("Non-linear-mode flag file (its mere presence skips the adjacency check): {non_linear_flag_path}");
     println!("Pending-resources directory: {}", pending_resources_dir.display());
+    println!("Bifrost marker directory: {}", bifrost_dir.display());
     Ok(())
 }
 

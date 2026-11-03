@@ -2,47 +2,73 @@ from dataclasses import dataclass
 
 from Options import Range, Choice, PerGameCommonOptions
 
+# Every option is documented the same way: the first line says which mode it applies to and
+# what it does; Choice options then list each value as "value: meaning". Northgard.yaml's
+# comments are generated from these docstrings, so keep them in sync by editing them here.
+
+
+class GameMode(Choice):
+    """Which Northgard mode this slot plays. Options marked Conquest or Bifrost only apply to
+    that mode.
+
+    conquest: the Conquest campaign map.
+    bifrost: the Bifrost roguelite."""
+    display_name = "Game Mode"
+    option_conquest = 0
+    option_bifrost = 1
+    default = 0
+
 
 class AmountOfLocations(Range):
-    """How many location checks each Chapter sends when you complete its battle (1-10)."""
-    display_name = "Items per Chapter"
+    """Conquest only. How many location checks each Chapter sends when you win its battle."""
+    display_name = "Items per Chapter (Conquest)"
     range_start = 1
     range_end = 10
     default = 4
 
 
 class ProgressionMode(Choice):
-    """Linear (default): Northgard's own adjacency rule still applies on top of owning a
-    Chapter's item -- you must have beaten a connected Chapter before the next one opens
-    up, same as vanilla Conquest.
+    """Conquest only. How a Chapter becomes selectable once you have its item.
 
-    Non-Linear: a Chapter becomes selectable as soon as you receive its item, with no
-    requirement to have already beaten an adjacent Chapter first -- you can jump straight
-    to a later branch of the tree out of order."""
-    display_name = "Progression Mode"
+    linear: you must also have beaten a connected Chapter, as in vanilla Conquest.
+    non_linear: the item alone is enough, so you can jump ahead in the tree."""
+    display_name = "Progression Mode (Conquest)"
     option_linear = 0
     option_non_linear = 1
     default = 0
 
 
 class Chapter7Requirement(Range):
-    """Non-Linear Mode only (ignored in Linear Mode): how many *other* battles must
-    actually be won in-game before Chapter 07 (the final battle) becomes selectable, even
-    after you've received its item. Prevents rushing straight to the end the moment you
-    happen to receive Chapter 07's item. 0 means no extra requirement -- Chapter 07 unlocks
-    as soon as its item arrives, same as every other Chapter in Non-Linear Mode.
-
-    10 is the most other battles there are to win (every Top and Bottom battle across
-    Chapters 1-6) -- Non-Linear Mode lets you win both a Top and a Bottom battle instead of
-    just one, so this counts individual battles won, not Chapters."""
-    display_name = "Chapter 7 Requirement (Non-Linear Mode only)"
+    """Conquest only, with non_linear Progression Mode. How many other battles you must win
+    before Chapter 07, the final battle, becomes selectable, even with its item. 0: its item
+    alone is enough. 10: every Top and Bottom battle of Chapters 1-6."""
+    display_name = "Chapter 7 Requirement (Conquest)"
     range_start = 0
     range_end = 10
     default = 5
 
 
+class ApPerkCards(Choice):
+    """Bifrost only. How many cards on each perk screen are locations. Picking one sends a check
+    instead of giving the perk; once sent, that card shows a real perk on later visits. Portal
+    rewards always have one location card.
+
+    minimum: 1 card per screen.
+    half: half the cards, rounded up.
+    maximum: every card."""
+    display_name = "AP Perk Cards (Bifrost)"
+    option_minimum = 0
+    option_half = 1
+    option_maximum = 2
+    default = 1
+
+
 @dataclass
 class NorthgardOptions(PerGameCommonOptions):
+    game_mode: GameMode
+    # Conquest
     amount_of_locations: AmountOfLocations
     progression_mode: ProgressionMode
     chapter7_requirement: Chapter7Requirement
+    # Bifrost
+    ap_perk_cards: ApPerkCards

@@ -10,6 +10,8 @@ from .Locations import location_table, NorthgardLocation, VICTORY_LOCATION
 from .Regions import CHAPTERS, CHAPTER_CONNECTIONS, STARTING_CHAPTER, FINAL_CHAPTER
 from .Options import NorthgardOptions
 from .Rules import set_completion_rule
+from .Bifrost import REALM_ITEMS, BONUS_ITEMS
+from .BifrostRegions import create_bifrost_regions, create_bifrost_items
 
 
 def launch_client(*args) -> None:
@@ -43,9 +45,10 @@ class NorthgardWeb(WebWorld):
 
 
 class NorthgardWorld(World):
-    """Play Northgard's Conquest mode across its branching tree of Chapters. Each Chapter
-    beyond the first is gated behind an item you receive from the multiworld; completing a
-    Chapter's battle sends its location checks."""
+    """Play Northgard's Conquest mode across its branching tree of Chapters, or its roguelite
+    Bifrost mode across realms. In Conquest, each Chapter beyond the first is gated behind an
+    item and completing a Chapter's battle sends its checks. In Bifrost, realms are items,
+    objectives and perk picks are checks, and real perks arrive as bonus items."""
 
     game = "Northgard"
     author: str = "Chakraa"
@@ -57,13 +60,23 @@ class NorthgardWorld(World):
     item_name_to_id = {name: data.code for name, data in item_table.items()}
     location_name_to_id = {name: data.id for name, data in location_table.items()}
 
-    item_name_groups = {"Chapters": set(CHAPTER_ITEMS)}
+    item_name_groups = {
+        "Chapters": set(CHAPTER_ITEMS),
+        "Realms": set(REALM_ITEMS),
+        "Bonuses": set(BONUS_ITEMS),
+    }
+
+    def is_bifrost(self) -> bool:
+        return self.options.game_mode.value == self.options.game_mode.option_bifrost
 
     def create_item(self, name: str) -> NorthgardItem:
         data = item_table[name]
         return NorthgardItem(name, data.classification, data.code, self.player)
 
     def create_regions(self) -> None:
+        if self.is_bifrost():
+            create_bifrost_regions(self)
+            return
         menu = Region("Menu", self.player, self.multiworld)
         self.multiworld.regions.append(menu)
 
@@ -124,6 +137,9 @@ class NorthgardWorld(World):
         regions[FINAL_CHAPTER].locations.append(victory_location)
 
     def create_items(self) -> None:
+        if self.is_bifrost():
+            create_bifrost_items(self)
+            return
         # The player always starts able to enter the first node.
         self.multiworld.push_precollected(self.create_item(STARTING_CHAPTER))
 
@@ -152,7 +168,13 @@ class NorthgardWorld(World):
         set_completion_rule(self.multiworld, self.player)
 
     def fill_slot_data(self) -> dict[str, Any]:
+        if self.is_bifrost():
+            return {
+                "game_mode": "bifrost",
+                "ap_perk_cards": self.options.ap_perk_cards.value,
+            }
         return {
+            "game_mode": "conquest",
             "amount_of_locations": self.options.amount_of_locations.value,
             "non_linear_mode": self.options.progression_mode.value == self.options.progression_mode.option_non_linear,
             "chapter7_requirement": self.options.chapter7_requirement.value,
