@@ -16,12 +16,14 @@ and seen_<Realm>_<Screen>_<K> (an AP card was shown on a perk screen: hint its i
 
 Every state marker is rewritten from this slot's own state (seed:team:slot) on every poll, and
 stray ones are removed, so switching rooms or slots can never leak unlocks between them. Done
-markers are kept until a connected slot sends them: progress made while the client was closed is
-sent on the next connect.
+markers are kept until their own slot sends them: progress made while the client was closed is
+sent on the next connect to that slot, and set aside if a different room connects first (see
+switch_room_records).
 """
 from __future__ import annotations
 
 import os
+import time
 from typing import TYPE_CHECKING, Iterable
 
 from .Bifrost import (
@@ -79,46 +81,154 @@ def _room_folder(config_dir: str, room_key: str) -> str:
     return os.path.join(bifrost_dir(config_dir), "rooms", safe)
 
 
-def switch_granted_records(config_dir: str, room_key: str) -> None:
-    """The game reads and writes its per-run "granted" records (one per bonus item copy it has
-    already given a player in a run, see patch_bonus_items) in bifrost/granted. Those belong to
-    one seed:slot, so each room keeps its own set: when the connected room changes, the current
-    set is parked under bifrost/rooms/<room>/granted and the new room's set is moved in. Going
-    room A -> B -> A mid-run then never grants A's bonuses twice."""
-    live = os.path.join(bifrost_dir(config_dir), "granted")
-    owner_file = os.path.join(bifrost_dir(config_dir), "granted_owner.txt")
+# The game names granted records "<runSeed>_<playerUID>_<Key>_<n>" and never deletes any, so
+# without cleanup they pile up by a few dozen files every run. A run needs its records exactly as
+# long as it can still be loaded, i.e. while its save (save\bifrost\<Clan>-<runSeed>.sav, deleted
+# by the game when the run is won) exists; see live_bifrost_runs. Records touched this recently
+# are always kept: a brand new run may not have written its save yet, and deleting a record the
+# running game still checks would grant that bonus again.
+GRANTED_GRACE_SECONDS = 2 * 86400
+
+
+def live_bifrost_runs(northgard_save_dir: str) -> set[str] | None:
+    """Run seeds that still have a Bifrost save, from the save file names. None when the save
+    folder can't be read, which means "don't know": nothing is pruned then."""
+    if not northgard_save_dir:
+        return None
+    try:
+        names = os.listdir(os.path.join(northgard_save_dir, "bifrost"))
+    except OSError:
+        return None
+    runs: set[str] = set()
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        seed = stem.rsplit("-", 1)[-1]
+        if ext.lower() == ".sav" and seed.isdigit():
+            runs.add(seed)
+    return runs
+
+
+def _move_all(src: str, dst: str) -> None:
+    """Moves every file in src into dst, creating dst only when there is something to move
+    (emptied parked folders are removed by _sweep_parked_rooms)."""
+    try:
+        names = os.listdir(src)
+    except OSError:
+        return
+    if names:
+        os.makedirs(dst, exist_ok=True)
+    for name in names:
+        try:
+            os.replace(os.path.join(src, name), os.path.join(dst, name))
+        except OSError:
+            pass
+
+
+def _remove_if_empty(path: str) -> None:
+    try:
+        os.rmdir(path)  # only succeeds on an empty folder
+    except OSError:
+        pass
+
+
+def _prune_granted_runs(granted: str, live_runs: set[str] | None) -> None:
+    """Deletes the granted records of runs whose save is gone (see GRANTED_GRACE_SECONDS)."""
+    if live_runs is None:
+        return
+    try:
+        names = os.listdir(granted)
+    except OSError:
+        return
+    newest: dict[str, float] = {}  # run seed -> newest record time
+    for name in names:
+        parts = name.rsplit("_", 3)
+        if len(parts) != 4:
+            continue  # not a granted record: leave it alone
+        try:
+            mtime = os.path.getmtime(os.path.join(granted, name))
+        except OSError:
+            continue
+        newest[parts[0]] = max(newest.get(parts[0], 0.0), mtime)
+    cutoff = time.time() - GRANTED_GRACE_SECONDS
+    stale = {run for run, mtime in newest.items() if run not in live_runs and mtime < cutoff}
+    if not stale:
+        return
+    for name in names:
+        parts = name.rsplit("_", 3)
+        if len(parts) == 4 and parts[0] in stale:
+            try:
+                os.remove(os.path.join(granted, name))
+            except OSError:
+                pass
+
+
+def _sweep_parked_rooms(config_dir: str, live_runs: set[str] | None) -> None:
+    """Prunes every parked room's granted records and removes folders left empty, including
+    ones from rooms never reconnected to (or created empty by older versions)."""
+    rooms = os.path.join(bifrost_dir(config_dir), "rooms")
+    try:
+        entries = os.listdir(rooms)
+    except OSError:
+        return
+    for entry in entries:
+        room = os.path.join(rooms, entry)
+        if not os.path.isdir(room):
+            continue
+        _prune_granted_runs(os.path.join(room, "granted"), live_runs)
+        for sub in ("granted", "done"):
+            _remove_if_empty(os.path.join(room, sub))
+        _remove_if_empty(room)
+    _remove_if_empty(rooms)
+
+
+def switch_room_records(config_dir: str, room_key: str, live_runs: set[str] | None) -> None:
+    """Swaps the per-room files the game writes when the connected room changes. Both kinds
+    belong to the room that was connected when they were written (the owner), so the current
+    set is parked under bifrost/rooms/<owner>/ and the new room's own set is moved back in:
+      granted/  The game's per-run "granted" records (one per bonus item copy it has already
+                given a player in a run, see patch_bonus_items). Going room A -> B -> A mid-run
+                then never grants A's bonuses twice.
+      done/     Done markers not sent yet, e.g. progress made with the client closed. Without
+                this, the next Bifrost slot to connect would send another slot's leftover
+                checks as its own (and its Vanaheim marker as its goal, releasing it).
+    Conquest rooms take part too (with nothing to park): the game only writes either kind while
+    active.flag is set, i.e. after a Bifrost room connected, so whatever is live always belongs
+    to the last room connected.
+
+    Also keeps the folder from growing forever: granted records of runs whose save is gone are
+    deleted (see GRANTED_GRACE_SECONDS; live_runs from live_bifrost_runs, None skips that),
+    and a room folder left with nothing parked in it is removed."""
+    folder = bifrost_dir(config_dir)
+    live_granted = os.path.join(folder, "granted")
+    owner_file = os.path.join(folder, "granted_owner.txt")
     try:
         with open(owner_file, "r", encoding="utf-8") as f:
             owner = f.read().strip()
     except OSError:
         owner = ""
-    if owner == room_key:
-        return
-    os.makedirs(live, exist_ok=True)
-    if owner:
-        park = os.path.join(_room_folder(config_dir, owner), "granted")
-        os.makedirs(park, exist_ok=True)
-        for name in os.listdir(live):
-            try:
-                os.replace(os.path.join(live, name), os.path.join(park, name))
-            except OSError:
-                pass
-    else:
-        # Records with no known owner (written before this existed) can't be attributed.
-        for name in os.listdir(live):
-            try:
-                os.remove(os.path.join(live, name))
-            except OSError:
-                pass
-    incoming = os.path.join(_room_folder(config_dir, room_key), "granted")
-    if os.path.isdir(incoming):
-        for name in os.listdir(incoming):
-            try:
-                os.replace(os.path.join(incoming, name), os.path.join(live, name))
-            except OSError:
-                pass
-    with open(owner_file, "w", encoding="utf-8") as f:
-        f.write(room_key)
+    _prune_granted_runs(live_granted, live_runs)  # live set belongs to `owner`, whichever way this goes
+    if owner != room_key:
+        os.makedirs(live_granted, exist_ok=True)
+        if owner:
+            parked = _room_folder(config_dir, owner)
+            _move_all(live_granted, os.path.join(parked, "granted"))
+            _move_all(done_dir(config_dir), os.path.join(parked, "done"))
+        else:
+            # Granted records with no known owner (written before this existed) can't be
+            # attributed. Done markers are left for this room to send, as before.
+            for name in os.listdir(live_granted):
+                try:
+                    os.remove(os.path.join(live_granted, name))
+                except OSError:
+                    pass
+        incoming = _room_folder(config_dir, room_key)
+        _move_all(os.path.join(incoming, "granted"), live_granted)
+        _move_all(os.path.join(incoming, "done"), done_dir(config_dir))
+        with open(owner_file, "w", encoding="utf-8") as f:
+            f.write(room_key)
+    # Every call, not only on a real switch: also removes the folders just emptied above, and
+    # cleans up rooms nobody reconnects to even when the same room keeps reconnecting.
+    _sweep_parked_rooms(config_dir, live_runs)
 
 
 def _location_id(name: str) -> int:

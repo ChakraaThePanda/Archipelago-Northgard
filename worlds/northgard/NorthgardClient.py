@@ -749,6 +749,13 @@ class NorthgardContext(SuperContext):
         # connection attempt so a stale seed_name from a previous room can't get compared
         # against the next room's RoomInfo and falsely reject a genuine reconnect.
         self.seed_name = None
+        # CommonClient re-sends CLIENT_GOAL on every "Connected" packet while finished_game is
+        # set, and does it before our on_package/_apply_room_pin ever runs. AP 0.6.8+ resets it
+        # when the seed/team/slot changes, but 0.6.7 never does, so goaling one room and then
+        # connecting to another in the same client window instantly goaled (and, with auto
+        # release, released) the new room too. Clearing it here is safe for a same-room
+        # reconnect: the server already has that goal recorded.
+        self.finished_game = False
         await super().connect(address)
 
     def _apply_room_pin(self) -> None:
@@ -764,6 +771,7 @@ class NorthgardContext(SuperContext):
         self._known_room_key = room_key
         _claim_legacy_filler_progress(self, room_key)
         old_save_path = self.pinned_save_path
+        self.finished_game = False  # the previous room's goal; see connect()
         self.sent_chapters.clear()
         self.received_chapters.clear()
         self.written_markers.clear()
@@ -773,7 +781,11 @@ class NorthgardContext(SuperContext):
         bifrost_client.clear_state_markers(_CONFIG_DIR)  # rewritten from this slot's own state on the next poll
         self.bifrost_scouts.clear()  # scouted items belong to the previous slot
         self.bifrost_scouted = False
-        bifrost_client.switch_granted_records(_CONFIG_DIR, room_key)  # this seed:slot's own bonus records
+        # This seed:slot's own bonus records and unsent done markers.
+        bifrost_client.switch_room_records(
+            _CONFIG_DIR, room_key, bifrost_client.live_bifrost_runs(NORTHGARD_SAVE_DIR),
+        )
+        self._warned_missing_save = None  # warn again if the new room's pinned save is missing too
 
         pinned_filename = _load_pins().get(room_key)
         if not pinned_filename:
@@ -1110,8 +1122,12 @@ async def save_watcher(ctx: NorthgardContext):
                 state = read_conquest_run_state(ctx.pinned_save_path)
                 _sync_unlock_markers(ctx, state)
 
+                # Only while connected to a slot: send_msgs silently drops messages with no
+                # server, and a chapter marked sent here would then never be sent again on a
+                # reconnect to the same room (which keeps sent_chapters). Waiting instead sends
+                # chapters finished while disconnected as soon as the slot is back.
                 new_chapters = [c for c in state.completed_chapters if c not in ctx.sent_chapters]
-                if new_chapters:
+                if new_chapters and _room_key(ctx) is not None:
                     location_ids: list[int] = []
                     for chapter in new_chapters:
                         location_ids.extend(ctx.location_ids_for_chapter(chapter))
