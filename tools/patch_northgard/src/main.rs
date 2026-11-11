@@ -114,7 +114,9 @@ const FILLER_SEEN_FIELD_PREFIX: &str = "apFillerSeen_";
 // only picks buildings vanilla Bifrost can offer (bifrostSelectionWeight > 0); 15 = /debugreward
 // testing aid (objective reward screens on demand); 16 = debug reward screens use the game's own
 // choice-type constants; 17 = testing aids (/debugwave, /debugreward hook) removed.
-const PATCH_VERSION: u32 = 17;
+// 18 = granted records stamped with the run save's step, so bonus items granted in a lost or
+// reloaded realm are granted again (pool categories included); legacy pool records re-rolled.
+const PATCH_VERSION: u32 = 18;
 const PATCH_VERSION_STAMP_PREFIX: &str = "ArchipelagoNorthgardPatchVersion=";
 
 /// The PATCH_VERSION stamped into `code` by cmd_apply, or None if it has none (vanilla, or

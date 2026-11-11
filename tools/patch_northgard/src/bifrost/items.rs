@@ -304,6 +304,14 @@ const BONUS_CATEGORIES: &[BonusCategory] = &[
 ///   - a new run (new seed) grants everything again;
 ///   - real perks the player picks never count against their item copies.
 ///
+/// The run save only reaches disk when a realm is won (onBifrostWon raises save.step, then
+/// saves), so a grant made during a realm that is then lost, retried or reloaded is gone from
+/// the save while its record stays. Records therefore hold
+/// "<step>|<id>|<unitId>|<buildingId>|<resId>|<isAdvanced>" (see write_bonus_record): an older
+/// step means the grant was saved; the current step means it may not have been, so the exact
+/// same bonus is granted again unless the player has one with that id. Records from patch v17
+/// and older (just the id) are checked by ownership, and a lost pool copy is re-rolled.
+///
 /// Each (category, copy) also gets a bool sentinel on ent.Player (fresh every realm) caching
 /// "handled this realm", so after a realm's first tick there are no file checks for it at all,
 /// and a category stops at its first missing bonus marker.
@@ -379,6 +387,39 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
     let bf_ty = obj_type(code, "gamesys.bifrost.BifrostManager")?;
     let field_id = virtual_field(code, bonus_ty, "id")?;
     let field_adv = virtual_field(code, bonus_ty, "isAdvanced")?;
+    let field_unit = virtual_field(code, bonus_ty, "unitId")?;
+    let field_bld = virtual_field(code, bonus_ty, "buildingId")?;
+    let field_res = virtual_field(code, bonus_ty, "resId")?;
+    // save.step: the run's realm counter, raised (then saved) only when a realm is won.
+    let field_step = virtual_field(code, save_ty, "step")?;
+    let fn_split = find_string_split(code, env)?;
+    let parts_ty = match code.get(code.functions.iter().find(|f| f.findex.0 == fn_split).unwrap().t) {
+        hlbc::types::Type::Fun(tf) => tf.ret,
+        _ => bail!("internal error: String.split is not a function"),
+    };
+    // The player's own bonus list, read the way Player.getBonus does (it is the only reliable
+    // way to walk it): this.bonuses (an hxbit array proxy) -> .array (ArrayDyn) -> ArrayObj of
+    // PlayerBonus, each with .data (the bonus virtual).
+    let fn_get_bonus = find_method_findex(code, "ent.Player", "getBonus")?;
+    let gb = function(code, fn_get_bonus, "Player.getBonus")?;
+    if gb.ops.len() != 38 || gb.regs.len() != 19 {
+        bail!("Player.getBonus shape changed (expected 38 ops / 19 regs, got {} / {})", gb.ops.len(), gb.regs.len());
+    }
+    let field_bonuses = match &gb.ops[8] {
+        Opcode::GetThis { field, .. } => *field,
+        other => bail!("Player.getBonus op8 changed (expected GetThis), got {other:?}"),
+    };
+    let field_proxy_array = match &gb.ops[13] {
+        Opcode::Field { field, .. } => *field,
+        other => bail!("Player.getBonus op13 changed (expected Field), got {other:?}"),
+    };
+    let field_pb_data = match &gb.ops[30] {
+        Opcode::Field { field, .. } => *field,
+        other => bail!("Player.getBonus op30 changed (expected Field), got {other:?}"),
+    };
+    let (proxy_ty, owned_arr_ty, owned_dyn_ty, pb_ty, pdata_ty, pv_ty) =
+        (gb.regs[7], gb.regs[8], gb.regs[9], gb.regs[13], gb.regs[17], gb.regs[18]);
+    let field_pv_id = virtual_field(code, pv_ty, "id")?;
 
     struct Slot {
         sentinel: RefField,
@@ -412,8 +453,14 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
     let granted_dir = konst(code, &granted_dir_path);
     let granted_prefix = konst(code, &path_in(&granted_dir_path, ""));
     let underscore = konst(code, "_");
+    let bar = konst(code, "|");
+    let empty = konst(code, "");
+    let flag_true = konst(code, "1");
+    let flag_false = konst(code, "0");
     let zero = int_konst(code, 0);
     let one = int_konst(code, 1);
+    let part_idx: Vec<RefInt> = (0..RECORD_PARTS).map(|i| int_konst(code, i as i32)).collect();
+    let parts_count = int_konst(code, RECORD_PARTS as i32);
     let f = function(code, update, "ent.Player.update")?;
     let o = f.ops.clone();
     let nregs = f.regs.len();
@@ -461,8 +508,130 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
     let r_bweight = regs.alloc(env.i32_ty);
     let r_clan = regs.alloc(clan_ty);
     let r_nb_true = regs.alloc(null_bool_ty);
+    let r_step = regs.alloc(env.string_ty); // save.step as a string: the current realm's stamp
+    let r_step_i = regs.alloc(env.i32_ty);
+    let r_content = regs.alloc(env.string_ty);
+    let r_bar = regs.alloc(env.string_ty);
+    let r_parts = regs.alloc(parts_ty);
+    let r_part = regs.alloc(env.string_ty);
+    let r_k = regs.alloc(env.i32_ty);
+    let r_adv_b = regs.alloc(env.bool_ty);
+    let r_proxy = regs.alloc(proxy_ty);
+    let r_owned = regs.alloc(owned_arr_ty);
+    let r_owned_dyn = regs.alloc(owned_dyn_ty);
+    let r_pb = regs.alloc(pb_ty);
+    let r_pdata = regs.alloc(pdata_ty);
+    let r_pv = regs.alloc(pv_ty);
+    let r_pid = regs.alloc(env.string_ty);
+    let r_j = regs.alloc(env.i32_ty);
+    let r_jlen = regs.alloc(env.i32_ty);
+    let r_jraw = regs.alloc(env.array_ty);
+    let r_jdyn = regs.alloc(env.dyn_ty);
+    let r_adv_n = regs.alloc(null_bool_ty);
 
     use Opcode::*;
+    // Jumps to `differ` unless strings x and y are equal (a null on either side differs).
+    let str_eq = |a: &mut Assembler, x: Reg, y: Reg, differ: Lbl| {
+        a.jump(JNull { reg: x, offset: 0 }, differ);
+        a.jump(JNull { reg: y, offset: 0 }, differ);
+        a.op(Field { dst: r_la, obj: x, field: env.field_length });
+        a.op(Field { dst: r_lb, obj: y, field: env.field_length });
+        a.jump(JNotEq { a: r_la, b: r_lb, offset: 0 }, differ);
+        a.op(Field { dst: r_ba, obj: x, field: env.field_bytes });
+        a.op(Field { dst: r_bb, obj: y, field: env.field_bytes });
+        a.op(Call3 { dst: r_cmp, fun: RefFun(fn_string_compare), arg0: r_ba, arg1: r_bb, arg2: r_la });
+        a.jump(JNotEq { a: r_cmp, b: r_zero, offset: 0 }, differ);
+    };
+    // dst = r_parts[i] (the caller has checked the length).
+    let part = |a: &mut Assembler, i: usize, dst: Reg| {
+        a.op(Field { dst: r_jraw, obj: r_parts, field: RefField(1) });
+        a.op(Int { dst: r_k, ptr: part_idx[i] });
+        a.op(GetArray { dst: r_jdyn, array: r_jraw, index: r_k });
+        a.op(UnsafeCast { dst, src: r_jdyn });
+    };
+    // Jumps to `owned` when this player has any bonus whose id is `id`, whatever its unit,
+    // building or resource. Deliberately loose: a false "owned" can only skip a re-grant,
+    // never grant a bonus twice.
+    let owns_id = |a: &mut Assembler, id: Reg, owned: Lbl| {
+        let not_owned = a.label();
+        let lp = a.label();
+        let next = a.label();
+        a.op(GetThis { dst: r_proxy, field: field_bonuses });
+        a.jump(JNull { reg: r_proxy, offset: 0 }, not_owned);
+        a.op(Field { dst: r_owned_dyn, obj: r_proxy, field: field_proxy_array });
+        a.jump(JNull { reg: r_owned_dyn, offset: 0 }, not_owned);
+        a.op(SafeCast { dst: r_owned, src: r_owned_dyn });
+        a.jump(JNull { reg: r_owned, offset: 0 }, not_owned);
+        a.op(Int { dst: r_j, ptr: zero });
+        a.bind_loop(lp);
+        a.op(Field { dst: r_jlen, obj: r_owned, field: RefField(0) });
+        a.jump(JSGte { a: r_j, b: r_jlen, offset: 0 }, not_owned);
+        a.op(Field { dst: r_jraw, obj: r_owned, field: RefField(1) });
+        a.op(GetArray { dst: r_jdyn, array: r_jraw, index: r_j });
+        a.op(Incr { dst: r_j });
+        a.op(UnsafeCast { dst: r_pb, src: r_jdyn });
+        a.jump(JNull { reg: r_pb, offset: 0 }, next);
+        a.op(Field { dst: r_pdata, obj: r_pb, field: field_pb_data });
+        a.jump(JNull { reg: r_pdata, offset: 0 }, next);
+        a.op(ToVirtual { dst: r_pv, src: r_pdata });
+        a.jump(JNull { reg: r_pv, offset: 0 }, next);
+        a.op(Field { dst: r_pid, obj: r_pv, field: field_pv_id });
+        str_eq(a, r_pid, id, next);
+        a.jump(JAlways { offset: 0 }, owned);
+        a.bind(next);
+        a.jump(JAlways { offset: 0 }, lp);
+        a.bind(not_owned);
+    };
+    // r_content += "|" + s, with a null s written as "".
+    let append = |a: &mut Assembler, s: Reg| {
+        let have = a.label();
+        emit_str(a, env, &sc, r_tmp, bar);
+        emit_concat(a, env, r_content, r_content, r_tmp);
+        a.op(Mov { dst: r_part, src: s });
+        a.jump(JNotNull { reg: r_part, offset: 0 }, have);
+        emit_str(a, env, &sc, r_part, empty);
+        a.bind(have);
+        emit_concat(a, env, r_content, r_content, r_part);
+    };
+    // Writes the granted record for the bonus in r_v: "<step>|<id>|<unitId>|<buildingId>|<resId>|<isAdvanced 1/0/empty>".
+    let write_bonus_record = |a: &mut Assembler| {
+        let adv_done = a.label();
+        let adv_false = a.label();
+        a.op(Mov { dst: r_content, src: r_step });
+        a.op(Field { dst: r_vid, obj: r_v, field: field_id });
+        append(a, r_vid);
+        a.op(Field { dst: r_vid, obj: r_v, field: field_unit });
+        append(a, r_vid);
+        a.op(Field { dst: r_vid, obj: r_v, field: field_bld });
+        append(a, r_vid);
+        a.op(Field { dst: r_vid, obj: r_v, field: field_res });
+        append(a, r_vid);
+        a.op(Null { dst: r_vid });
+        a.op(Field { dst: r_adv_n, obj: r_v, field: field_adv });
+        a.jump(JNull { reg: r_adv_n, offset: 0 }, adv_done);
+        a.op(SafeCast { dst: r_adv_b, src: r_adv_n });
+        a.jump(JFalse { cond: r_adv_b, offset: 0 }, adv_false);
+        emit_str(a, env, &sc, r_vid, flag_true);
+        a.jump(JAlways { offset: 0 }, adv_done);
+        a.bind(adv_false);
+        emit_str(a, env, &sc, r_vid, flag_false);
+        a.bind(adv_done);
+        append(a, r_vid);
+        emit_str(a, env, &sc, r_tmp, granted_dir);
+        a.op(Call1 { dst: sc.void, fun: RefFun(env.fn_create_dir), arg0: r_tmp });
+        a.op(Call2 { dst: sc.void, fun: RefFun(env.fn_save_content), arg0: r_record, arg1: r_content });
+    };
+    // Same record format for a building: "<step>|<buildingId>||||".
+    let write_building_record = |a: &mut Assembler, bid: Reg| {
+        a.op(Mov { dst: r_content, src: r_step });
+        append(a, bid);
+        for _ in 0..(RECORD_PARTS - 2) {
+            append(a, r_null);
+        }
+        emit_str(a, env, &sc, r_tmp, granted_dir);
+        a.op(Call1 { dst: sc.void, fun: RefFun(env.fn_create_dir), arg0: r_tmp });
+        a.op(Call2 { dst: sc.void, fun: RefFun(env.fn_save_content), arg0: r_record, arg1: r_content });
+    };
     let mut a = Assembler::new();
     let original = a.label();
     a.op(GetThis { dst: r_aijob, field: field_aijob });
@@ -501,6 +670,9 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
     emit_str(&mut a, env, &sc, r_tmp, underscore);
     emit_concat(&mut a, env, r_base, r_base, r_tmp);
     emit_concat(&mut a, env, r_base, r_base, r_uid);
+    a.op(Field { dst: r_step_i, obj: r_save, field: field_step });
+    a.op(ToDyn { dst: r_dyn, src: r_step_i });
+    a.op(Call1 { dst: r_step, fun: RefFun(fn_std_string), arg0: r_dyn });
     a.op(Bool { dst: r_true, value: true });
     a.op(Bool { dst: r_false, value: false });
     a.op(ToDyn { dst: r_nb, src: r_false });
@@ -521,19 +693,75 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
             emit_str(&mut a, env, &sc, r_tmp, slot.marker);
             emit_exists(&mut a, env, sc.boolean, r_tmp);
             a.jump(JFalse { cond: sc.boolean, offset: 0 }, cat_end);
-            // Already granted in this run? The record holds the bonus id it gave.
+            // Already granted in this run? See the record format in write_bonus_record.
             emit_str(&mut a, env, &sc, r_tmp, slot.suffix);
             emit_concat(&mut a, env, r_record, r_base, r_tmp);
             emit_exists(&mut a, env, sc.boolean, r_record);
             let fresh = a.label();
+            let legacy = a.label();
             a.jump(JFalse { cond: sc.boolean, offset: 0 }, fresh);
+            a.op(Call1 { dst: r_content, fun: RefFun(fn_get_content), arg0: r_record });
+            a.jump(JNull { reg: r_content, offset: 0 }, handled);
+            emit_str(&mut a, env, &sc, r_bar, bar);
+            a.op(Call2 { dst: r_parts, fun: RefFun(fn_split), arg0: r_content, arg1: r_bar });
+            a.jump(JNull { reg: r_parts, offset: 0 }, legacy);
+            a.op(Field { dst: r_k, obj: r_parts, field: RefField(0) });
+            a.op(Int { dst: r_jlen, ptr: parts_count });
+            a.jump(JSLt { a: r_k, b: r_jlen, offset: 0 }, legacy);
+            // Stamped record. The run save only reaches disk when a realm is won, and winning
+            // raises save.step first. So a record stamped with an older step was saved with
+            // the run: done. One stamped with the current step was granted in an attempt at
+            // this realm that was never saved (lost, retried, reloaded): unless the player
+            // somehow still has it, grant the very same bonus again, keeping the record.
+            part(&mut a, 0, r_part);
+            str_eq(&mut a, r_part, r_step, handled);
+            part(&mut a, 1, r_id);
+            a.jump(JNull { reg: r_id, offset: 0 }, handled);
+            a.op(Field { dst: r_la, obj: r_id, field: env.field_length });
+            a.jump(JSLte { a: r_la, b: r_zero, offset: 0 }, handled);
+            match &cat.source {
+                BonusSource::Building => {
+                    a.op(Call2 { dst: sc.boolean, fun: RefFun(fn_building_allowed), arg0: r_bf, arg1: r_id });
+                    a.jump(JTrue { cond: sc.boolean, offset: 0 }, handled);
+                    a.op(Call2 { dst: sc.void, fun: RefFun(fn_add_building), arg0: Reg(0), arg1: r_id });
+                }
+                BonusSource::Fixed(_) | BonusSource::Pool(_) => {
+                    owns_id(&mut a, r_id, handled);
+                    a.op(New { dst: r_v });
+                    a.op(SetField { obj: r_v, field: field_id, src: r_id });
+                    for (i, field) in [(2, field_unit), (3, field_bld), (4, field_res)] {
+                        let skip = a.label();
+                        part(&mut a, i, r_part);
+                        a.jump(JNull { reg: r_part, offset: 0 }, skip);
+                        a.op(Field { dst: r_la, obj: r_part, field: env.field_length });
+                        a.jump(JSLte { a: r_la, b: r_zero, offset: 0 }, skip);
+                        a.op(SetField { obj: r_v, field, src: r_part });
+                        a.bind(skip);
+                    }
+                    let adv_done = a.label();
+                    let not_true = a.label();
+                    part(&mut a, 5, r_part);
+                    emit_str(&mut a, env, &sc, r_tmp, flag_true);
+                    str_eq(&mut a, r_part, r_tmp, not_true);
+                    a.op(SetField { obj: r_v, field: field_adv, src: r_nb_true });
+                    a.jump(JAlways { offset: 0 }, adv_done);
+                    a.bind(not_true);
+                    emit_str(&mut a, env, &sc, r_tmp, flag_false);
+                    str_eq(&mut a, r_part, r_tmp, adv_done);
+                    a.op(SetField { obj: r_v, field: field_adv, src: r_nb });
+                    a.bind(adv_done);
+                    a.op(Call2 { dst: sc.void, fun: RefFun(fn_apply), arg0: Reg(0), arg1: r_v });
+                }
+            }
+            a.jump(JAlways { offset: 0 }, handled);
+            // Legacy record (patch v17 and older): just the bonus id, no step, so it can't tell
+            // whether the run save kept the grant. Decided by what the player owns instead.
+            a.bind(legacy);
+            a.op(Mov { dst: r_id, src: r_content });
             match &cat.source {
                 BonusSource::Fixed(_) => {
-                    // The run save only reaches disk when a realm is won, so a reload mid-realm
-                    // loses grants made since. Still owned: done. Lost: grant the same id again,
-                    // keeping the existing record.
-                    a.op(Call1 { dst: r_id, fun: RefFun(fn_get_content), arg0: r_record });
-                    a.jump(JNull { reg: r_id, offset: 0 }, handled);
+                    // Fixed ids have no unit/resource/building, so hasBonus is exact. Still
+                    // owned: done. Lost: grant the same id again, keeping the record.
                     a.op(Field { dst: r_la, obj: r_id, field: env.field_length });
                     a.jump(JSLte { a: r_la, b: r_zero, offset: 0 }, handled);
                     a.op(CallN { dst: sc.boolean, fun: RefFun(fn_has), args: vec![Reg(0), r_id, r_null, r_null, r_null] });
@@ -545,14 +773,17 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
                     a.jump(JAlways { offset: 0 }, handled);
                 }
                 BonusSource::Pool(_) => {
-                    // Variants carry a unit/resource id, so "still owned" can't be checked by id
-                    // alone; a mid-realm reload loses this copy until the next run.
-                    a.jump(JAlways { offset: 0 }, handled);
+                    // The record lacks the unit/resource/building, so the same bonus can't be
+                    // rebuilt. Player has a bonus with this id: done. None at all: the grant was
+                    // lost, so roll a fresh one (which rewrites the record in the new format).
+                    // Recovers copies older patches lost to a failed realm, with no manual step.
+                    a.op(Field { dst: r_la, obj: r_id, field: env.field_length });
+                    a.jump(JSLte { a: r_la, b: r_zero, offset: 0 }, handled);
+                    owns_id(&mut a, r_id, handled);
+                    a.jump(JAlways { offset: 0 }, fresh);
                 }
                 BonusSource::Building => {
                     // Still unlocked: done. Lost after a reload: unlock the same building again.
-                    a.op(Call1 { dst: r_id, fun: RefFun(fn_get_content), arg0: r_record });
-                    a.jump(JNull { reg: r_id, offset: 0 }, handled);
                     a.op(Field { dst: r_la, obj: r_id, field: env.field_length });
                     a.jump(JSLte { a: r_la, b: r_zero, offset: 0 }, handled);
                     a.op(Call2 { dst: sc.boolean, fun: RefFun(fn_building_allowed), arg0: r_bf, arg1: r_id });
@@ -740,9 +971,7 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
                     a.op(Field { dst: r_vid, obj: r_bld, field: field_building_id });
                     a.jump(JNull { reg: r_vid, offset: 0 }, handled);
                     a.op(Call2 { dst: sc.void, fun: RefFun(fn_add_building), arg0: Reg(0), arg1: r_vid });
-                    emit_str(&mut a, env, &sc, r_tmp, granted_dir);
-                    a.op(Call1 { dst: sc.void, fun: RefFun(env.fn_create_dir), arg0: r_tmp });
-                    a.op(Call2 { dst: sc.void, fun: RefFun(env.fn_save_content), arg0: r_record, arg1: r_vid });
+                    write_building_record(&mut a, r_vid);
                     a.jump(JAlways { offset: 0 }, handled);
                 }
             }
@@ -750,11 +979,7 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
             // the granted record.
             a.bind(grant);
             a.op(Call2 { dst: sc.void, fun: RefFun(fn_apply), arg0: Reg(0), arg1: r_v });
-            // Record = the granted bonus id (read back after a reload, see above).
-            emit_str(&mut a, env, &sc, r_tmp, granted_dir);
-            a.op(Call1 { dst: sc.void, fun: RefFun(env.fn_create_dir), arg0: r_tmp });
-            a.op(Field { dst: r_vid, obj: r_v, field: field_id });
-            a.op(Call2 { dst: sc.void, fun: RefFun(env.fn_save_content), arg0: r_record, arg1: r_vid });
+            write_bonus_record(&mut a);
             a.bind(handled);
             a.op(SetThis { field: slot.sentinel, src: r_true });
             a.bind(next_copy);
@@ -766,6 +991,25 @@ pub fn patch_bonus_items(code: &mut Bytecode, env: &Env) -> Result<()> {
     let mut ops = a.finish()?;
     ops.extend(o);
     install(code, update, ops, regs.new, |i| i.saturating_sub(n))
+}
+
+/// Fields in a granted record: step, id, unitId, buildingId, resId, isAdvanced.
+const RECORD_PARTS: usize = 6;
+
+/// Haxe's String.split(String) -> Array<String>. Looked up by shape: the std String methods
+/// carry no owning class in this build, so find_method_findex can't see them.
+fn find_string_split(code: &Bytecode, env: &Env) -> Result<usize> {
+    let found: Vec<usize> = code
+        .functions
+        .iter()
+        .filter(|f| f.name(code) == "split" && f.regs.len() >= 2 && f.regs[0] == env.string_ty && f.regs[1] == env.string_ty)
+        .filter(|f| matches!(code.get(f.t), Type::Fun(tf) if tf.args.len() == 2))
+        .map(|f| f.findex.0)
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(*one),
+        other => bail!("expected exactly one String.split, found {other:?}. Northgard build mismatch?"),
+    }
 }
 
 /// Variant-free fallbacks per pool category (no unit/resource/building choice, no building
