@@ -10,6 +10,9 @@
 //!   realm_<Realm>           realm is unlocked (Midgard always, the others by item)
 //!   loc_<Realm>             realm still holds at least one unchecked location
 //!   obj_<Realm>_<ObjId>     that objective still holds an unchecked location in that realm
+//!   objmain_<Realm>_<ObjId> that objective's own check (not its reward card) is unchecked
+//!   objprog_<Realm>_<ObjId> that objective or its reward card holds a progression item
+//!   prog_<Realm>            realm holds an unchecked location with a progression item
 //! Marker files the game WRITES (read and deleted by the client), under `bifrost\done\`:
 //!   obj_<Realm>_<ObjId>     objective completed
 //!   realm_<Realm>           realm won
@@ -26,6 +29,7 @@ use hlbc::{Bytecode, Resolve};
 use super::{find_field_by_name, find_method_findex, find_type_index_by_name};
 
 mod items;
+mod rewards;
 
 pub const BIFROST_SUBDIR: &str = "bifrost";
 pub const DONE_SUBDIR: &str = "done";
@@ -362,6 +366,11 @@ pub fn apply_all(code: &mut Bytecode, env: &Env) -> Result<()> {
     items::patch_bonus_items(code, env)?;
     items::patch_ap_cards(code, env)?;
     items::patch_ap_card_selectable(code, env)?;
+    // patch_reward_filter reads initRewards' original shape, so it runs before the fallback.
+    rewards::patch_reward_filter(code, env)?;
+    rewards::patch_reward_fallback(code, env)?;
+    rewards::patch_reward_reroll(code, env)?;
+    rewards::patch_take_all_owned(code, env)?;
     Ok(())
 }
 
@@ -373,8 +382,9 @@ pub fn path_in(dir: &str, name: &str) -> String {
 /// not yet finished this run, minus Midgard and Vanaheim), returns `[Vanaheim]` at step 3,
 /// pushes Midgard first at step 0, then fills up to 2 offers with seeded random picks from the
 /// pool. That last loop (op 63 onward) is where our block is inserted: when Bifrost mode is
-/// active it sorts the pool into three tiers and fills the offers tier by tier, so unlocked
-/// realms with locations come first, then other unlocked realms, then locked ones (shown as
+/// active it sorts the pool into four tiers and fills the offers tier by tier, so unlocked
+/// realms holding a progression item (`prog_<Realm>`) come first, then unlocked realms with
+/// any location, then other unlocked realms, then locked ones (shown as
 /// greyed cards by patch_realm_cards_live). It never crashes on a short pool: each tier loop
 /// also stops when its tier is empty. When not active, it jumps straight into the original
 /// loop, untouched.
@@ -412,10 +422,11 @@ fn patch_get_next_realms(code: &mut Bytecode, env: &Env) -> Result<()> {
     let active = konst(code, &path_in(&env.bifrost_dir, ACTIVE_FLAG_NAME));
     let realm_prefix = konst(code, &path_in(&env.bifrost_dir, "realm_"));
     let loc_prefix = konst(code, &path_in(&env.bifrost_dir, "loc_"));
+    let prog_prefix = konst(code, &path_in(&env.bifrost_dir, "prog_"));
 
     let mut regs = Regs::new(r.len());
     let sc = Scratch::new(env, &mut regs);
-    let r_tiers = [regs.alloc(r[3]), regs.alloc(r[3]), regs.alloc(r[3])];
+    let r_tiers = [regs.alloc(r[3]), regs.alloc(r[3]), regs.alloc(r[3]), regs.alloc(r[3])];
     let r_i = regs.alloc(env.i32_ty);
     let r_len = regs.alloc(env.i32_ty);
     let r_raw = regs.alloc(r[6]);
@@ -452,6 +463,7 @@ fn patch_get_next_realms(code: &mut Bytecode, env: &Env) -> Result<()> {
     a.op(Int { dst: r_i, ptr: zero });
     let sort_loop = a.label();
     let sort_done = a.label();
+    let to_a = a.label();
     let to_b = a.label();
     let to_c = a.label();
     a.bind_loop(sort_loop);
@@ -468,17 +480,24 @@ fn patch_get_next_realms(code: &mut Bytecode, env: &Env) -> Result<()> {
     emit_concat(&mut a, env, r_path, r_pfx, r_id);
     emit_exists(&mut a, env, sc.boolean, r_path);
     a.jump(JFalse { cond: sc.boolean, offset: 0 }, to_c);
+    emit_str(&mut a, env, &sc, r_pfx, prog_prefix);
+    emit_concat(&mut a, env, r_path, r_pfx, r_id);
+    emit_exists(&mut a, env, sc.boolean, r_path);
+    a.jump(JFalse { cond: sc.boolean, offset: 0 }, to_a);
+    a.op(Call2 { dst: r_tmp_i, fun: RefFun(fn_push), arg0: r_tiers[0], arg1: r_v });
+    a.jump(JAlways { offset: 0 }, sort_loop);
+    a.bind(to_a);
     emit_str(&mut a, env, &sc, r_pfx, loc_prefix);
     emit_concat(&mut a, env, r_path, r_pfx, r_id);
     emit_exists(&mut a, env, sc.boolean, r_path);
     a.jump(JFalse { cond: sc.boolean, offset: 0 }, to_b);
-    a.op(Call2 { dst: r_tmp_i, fun: RefFun(fn_push), arg0: r_tiers[0], arg1: r_v });
-    a.jump(JAlways { offset: 0 }, sort_loop);
-    a.bind(to_b);
     a.op(Call2 { dst: r_tmp_i, fun: RefFun(fn_push), arg0: r_tiers[1], arg1: r_v });
     a.jump(JAlways { offset: 0 }, sort_loop);
-    a.bind(to_c);
+    a.bind(to_b);
     a.op(Call2 { dst: r_tmp_i, fun: RefFun(fn_push), arg0: r_tiers[2], arg1: r_v });
+    a.jump(JAlways { offset: 0 }, sort_loop);
+    a.bind(to_c);
+    a.op(Call2 { dst: r_tmp_i, fun: RefFun(fn_push), arg0: r_tiers[3], arg1: r_v });
     a.jump(JAlways { offset: 0 }, sort_loop);
     a.bind(sort_done);
 
@@ -667,13 +686,19 @@ fn patch_realm_cards_live(code: &mut Bytecode, env: &Env) -> Result<()> {
     install(code, update, ops, regs.new, |i| i.saturating_sub(n))
 }
 
+/// Objective spawn priority tiers, best first. Each is a marker prefix the client writes as
+/// `<prefix><Realm>_<ObjId>`:
+///   objprog_  the objective (or its reward card) holds a progression item
+///   objmain_  the objective's own check is not done yet
+///   obj_      it still holds any unchecked location (e.g. only its reward card is left)
+const OBJECTIVE_TIERS: [&str; 3] = ["objprog_", "objmain_", "obj_"];
+
 /// `$HBifrost.pickObjective()`: objective spawn priority. Each of its three seeded
 /// `pickRandom(list, rand)` calls (one portal pick, the filtered portal pick, the standard
 /// pick) is replaced in place (see `splice`) with a block that, when Bifrost mode is active,
-/// filters the list down to objectives that still hold a location in the current realm
-/// (`obj_<Realm>_<ObjId>` markers) and picks from that if it is not empty, else from the full
-/// list as vanilla does. The block falls through to the op after the original call, so it
-/// never jumps backward into original code.
+/// filters the list down to the best non-empty OBJECTIVE_TIERS tier for the current realm and
+/// picks from that, else from the full list as vanilla does. The block falls through to the op
+/// after the original call, so it never jumps backward into original code.
 fn patch_pick_objective(code: &mut Bytecode, env: &Env) -> Result<()> {
     let findex = find_method_findex(code, "$HBifrost", "pickObjective")?;
     let f = function(code, findex, "$HBifrost.pickObjective")?;
@@ -712,7 +737,11 @@ fn patch_pick_objective(code: &mut Bytecode, env: &Env) -> Result<()> {
     let (field_bf_realm, _) = find_field_by_name(code, "gamesys.bifrost.BifrostManager", "realm")?;
 
     let active = konst(code, &path_in(&env.bifrost_dir, ACTIVE_FLAG_NAME));
-    let obj_prefix = konst(code, &path_in(&env.bifrost_dir, "obj_"));
+    // Priority tiers, best first (see the doc comment); each is a marker prefix.
+    let tier_prefixes: Vec<Konst> = OBJECTIVE_TIERS
+        .iter()
+        .map(|p| konst(code, &path_in(&env.bifrost_dir, p)))
+        .collect();
     let underscore = konst(code, "_");
     let zero = int_konst(code, 0);
 
@@ -754,37 +783,40 @@ fn patch_pick_objective(code: &mut Bytecode, env: &Env) -> Result<()> {
         a.jump(JNull { reg: r_realm, offset: 0 }, vanilla);
         a.jump(JNull { reg: src, offset: 0 }, vanilla);
         a.op(Int { dst: r_zero, ptr: zero });
-        a.op(Type { dst: r_type, ty: obj_ty_ref });
-        a.op(Call2 { dst: r_alloc, fun: RefFun(fn_alloc), arg0: r_type, arg1: r_zero });
-        a.op(UnsafeCast { dst: r_alloc2, src: r_alloc });
-        a.op(Call1 { dst: r_filtered, fun: RefFun(fn_wrap), arg0: r_alloc2 });
-        a.op(Int { dst: r_i, ptr: zero });
-        let lp = a.label();
-        let done = a.label();
-        let next = a.label();
-        a.bind_loop(lp);
-        a.op(Field { dst: r_len, obj: src, field: field_len });
-        a.jump(JSGte { a: r_i, b: r_len, offset: 0 }, done);
-        a.op(Field { dst: r_raw, obj: src, field: field_arr });
-        a.op(GetArray { dst: r_dyn, array: r_raw, index: r_i });
-        a.op(ToVirtual { dst: r_v, src: r_dyn });
-        a.op(Incr { dst: r_i });
-        a.jump(JNull { reg: r_v, offset: 0 }, next);
-        a.op(Field { dst: r_id, obj: r_v, field: field_obj_id });
-        a.jump(JNull { reg: r_id, offset: 0 }, next);
-        emit_str(&mut a, env, &sc, r_pfx, obj_prefix);
-        emit_concat(&mut a, env, r_path, r_pfx, r_realm);
-        emit_str(&mut a, env, &sc, r_pfx, underscore);
-        emit_concat(&mut a, env, r_path, r_path, r_pfx);
-        emit_concat(&mut a, env, r_path, r_path, r_id);
-        emit_exists(&mut a, env, sc.boolean, r_path);
-        a.jump(JFalse { cond: sc.boolean, offset: 0 }, next);
-        a.op(Call2 { dst: r_tmp_i, fun: RefFun(fn_push), arg0: r_filtered, arg1: r_v });
-        a.bind(next);
-        a.jump(JAlways { offset: 0 }, lp);
-        a.bind(done);
-        a.op(Field { dst: r_len, obj: r_filtered, field: field_len });
-        a.jump(JSGt { a: r_len, b: r_zero, offset: 0 }, pick_filtered);
+        for prefix in &tier_prefixes {
+            // r_filtered = the list's objectives that have a `<prefix><Realm>_<ObjId>` marker.
+            a.op(Type { dst: r_type, ty: obj_ty_ref });
+            a.op(Call2 { dst: r_alloc, fun: RefFun(fn_alloc), arg0: r_type, arg1: r_zero });
+            a.op(UnsafeCast { dst: r_alloc2, src: r_alloc });
+            a.op(Call1 { dst: r_filtered, fun: RefFun(fn_wrap), arg0: r_alloc2 });
+            a.op(Int { dst: r_i, ptr: zero });
+            let lp = a.label();
+            let done = a.label();
+            let next = a.label();
+            a.bind_loop(lp);
+            a.op(Field { dst: r_len, obj: src, field: field_len });
+            a.jump(JSGte { a: r_i, b: r_len, offset: 0 }, done);
+            a.op(Field { dst: r_raw, obj: src, field: field_arr });
+            a.op(GetArray { dst: r_dyn, array: r_raw, index: r_i });
+            a.op(ToVirtual { dst: r_v, src: r_dyn });
+            a.op(Incr { dst: r_i });
+            a.jump(JNull { reg: r_v, offset: 0 }, next);
+            a.op(Field { dst: r_id, obj: r_v, field: field_obj_id });
+            a.jump(JNull { reg: r_id, offset: 0 }, next);
+            emit_str(&mut a, env, &sc, r_pfx, *prefix);
+            emit_concat(&mut a, env, r_path, r_pfx, r_realm);
+            emit_str(&mut a, env, &sc, r_pfx, underscore);
+            emit_concat(&mut a, env, r_path, r_path, r_pfx);
+            emit_concat(&mut a, env, r_path, r_path, r_id);
+            emit_exists(&mut a, env, sc.boolean, r_path);
+            a.jump(JFalse { cond: sc.boolean, offset: 0 }, next);
+            a.op(Call2 { dst: r_tmp_i, fun: RefFun(fn_push), arg0: r_filtered, arg1: r_v });
+            a.bind(next);
+            a.jump(JAlways { offset: 0 }, lp);
+            a.bind(done);
+            a.op(Field { dst: r_len, obj: r_filtered, field: field_len });
+            a.jump(JSGt { a: r_len, b: r_zero, offset: 0 }, pick_filtered);
+        }
         a.bind(vanilla);
         a.op(Call2 { dst, fun: RefFun(fun), arg0, arg1 });
         a.jump(JAlways { offset: 0 }, back);

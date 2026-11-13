@@ -100,25 +100,8 @@ const FILLER_SEEN_FIELD_PREFIX: &str = "apFillerSeen_";
 // classify_battle_state reports any patched build without exactly this stamp as Outdated, so
 // the client's auto-heal re-applies it. Checking for a specific patched feature instead (as
 // an earlier version of this did) misses any later change that doesn't add a new one.
-// History: unstamped = everything up to the 2026.09.14 release; 2 = Filler grants reach every
-// human player in co-op; 3 = Bifrost mode patches; 4 = Bifrost card numbering by cards per
-// player, bonus items written to every machine's run save with per-run granted records; 5 =
-// random unowned pick for fixed bonus categories, pool-category debug readout; 6 = run key is
-// startSeed, records hold the granted id (re-grant after reload), pool match via string_compare; 7 = startSeed unwrapped before
-// it's turned into the run key; 8 = regrouped bonus categories, random pool picks, Building
-// Unlock items; 9 = pool-category fallback across co-op players, AP cards tinted on perk screens; 10 = AP cards show
-// the Archipelago logo and the scouted item as their tooltip (no tint); 11 = logo drawn in the
-// card's backIcon slot with every other art layer hidden; 12 = logo replaces the card's `back`
-// background instead, all four art layers hidden (same look for every card kind); 13 = wave card
-// positions counted across the whole screen (6 locations per wave screen); 14 = Building Unlock
-// only picks buildings vanilla Bifrost can offer (bifrostSelectionWeight > 0); 15 = /debugreward
-// testing aid (objective reward screens on demand); 16 = debug reward screens use the game's own
-// choice-type constants; 17 = testing aids (/debugwave, /debugreward hook) removed.
-// 18 = granted records stamped with the run save's step, so bonus items granted in a lost or
-// reloaded realm are granted again (pool categories included); legacy pool records re-rolled.
-// 19 = AP cards are always pickable (an owned or incompatible hidden perk no longer greys them
-// out and blocks the check).
-const PATCH_VERSION: u32 = 19;
+// Just a counter: what changed in each version is in git history, not here.
+const PATCH_VERSION: u32 = 22;
 const PATCH_VERSION_STAMP_PREFIX: &str = "ArchipelagoNorthgardPatchVersion=";
 
 /// The PATCH_VERSION stamped into `code` by cmd_apply, or None if it has none (vanilla, or
@@ -342,6 +325,16 @@ fn main() -> Result<()> {
         "whois" => {
             let findex: usize = args.get(3).context("usage: patch_northgard whois <dir> <findex>")?.parse()?;
             cmd_whois(&backup_path, &live_path, findex)
+        }
+        "globalconst" => {
+            let g: usize = args.get(3).context("usage: patch_northgard globalconst <dir> <global>")?.parse()?;
+            let source = if backup_path.exists() { &backup_path } else { &live_path };
+            let code = Bytecode::from_file(source.to_str().context("path isn't valid UTF-8")?).context("failed to parse hlboot.dat")?;
+            for c in code.constants.iter().flatten().filter(|c| c.global.0 == g) {
+                let s = c.fields.first().and_then(|&i| code.strings.get(i)).map(|s| s.to_string());
+                println!("global@{g}: fields={:?} first-as-string={s:?}", c.fields);
+            }
+            Ok(())
         }
         "natives" => cmd_natives(&backup_path, &live_path),
         "verify" => cmd_verify(&live_path),

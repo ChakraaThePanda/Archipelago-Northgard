@@ -147,10 +147,14 @@ pub fn patch_perk_pick(code: &mut Bytecode, env: &Env) -> Result<()> {
     let shape_ok = matches!(o[274], NullCheck { reg } if reg == Reg(41))
         && matches!(o[459], Call1 { .. })
         && matches!(o[470], Call2 { .. })
-        && matches!(o[471], Call1 { .. });
+        && matches!(o[471], Call1 { .. })
+        && matches!(o[278], EnumField { dst, .. } if dst == Reg(44))
+        && matches!(o[279], NullCheck { reg } if reg == Reg(36))
+        && matches!(o[280], Call2 { arg0, arg1, .. } if arg0 == Reg(36) && arg1 == Reg(44));
     if !shape_ok {
-        bail!("registerBonusPick ops 274/459/470/471 changed. Northgard build mismatch?");
+        bail!("registerBonusPick ops 274-280/459/470/471 changed. Northgard build mismatch?");
     }
+    let fn_has = find_method_findex(code, "gamesys.bifrost.BifrostBonusManager", "playerHasBonus")?;
     let fn_get_bifrost = find_method_findex(code, "gamesys.bifrost.BifrostBonusManager", "get_bifrost")?;
     let bf_ty = obj_type(code, "gamesys.bifrost.BifrostManager")?;
     let (field_realm, _) = find_field_by_name(code, "gamesys.bifrost.BifrostManager", "realm")?;
@@ -171,6 +175,7 @@ pub fn patch_perk_pick(code: &mut Bytecode, env: &Env) -> Result<()> {
     let r_key = regs.alloc(env.string_ty);
     let r_path = regs.alloc(env.string_ty);
     let r_tmp = regs.alloc(env.string_ty);
+    let r_has = regs.alloc(env.bool_ty);
 
     // If this pick is an AP card: write its done marker and jump to original op `skip_to`.
     // `index` is the card index register; None means position 0 (the TakeAll branch).
@@ -205,10 +210,26 @@ pub fn patch_perk_pick(code: &mut Bytecode, env: &Env) -> Result<()> {
     block_a.push(o[274].clone());
     let (mut block_b, ext_b) = build(None, 471)?;
     block_b.push(o[459].clone());
+    // Safety net: a perk the picking player (reg36) already owns (reg44, see patch_reward_filter
+    // for why this should be rare) is picked as "nothing": skip its apply call, op 280.
+    let (mut block_c, ext_c) = {
+        let mut a = Assembler::new();
+        let apply = a.label();
+        emit_require_active(&mut a, env, &sc, active, r_tmp, apply);
+        a.jump(JNull { reg: Reg(36), offset: 0 }, apply);
+        a.jump(JNull { reg: Reg(44), offset: 0 }, apply);
+        a.op(Call3 { dst: r_has, fun: RefFun(fn_has), arg0: Reg(0), arg1: Reg(44), arg2: Reg(36) });
+        a.jump(JFalse { cond: r_has, offset: 0 }, apply);
+        a.jump_original(JAlways { offset: 0 }, 333);
+        a.bind(apply);
+        a.finish_with_externals()?
+    };
+    block_c.push(o[279].clone());
     let (ops, old_of_new) = splice(
         &o,
         vec![
             Replacement { at: 274, block: block_a, external: ext_a },
+            Replacement { at: 279, block: block_c, external: ext_c },
             Replacement { at: 459, block: block_b, external: ext_b },
         ],
     )?;
@@ -1313,7 +1334,13 @@ impl GreyStyle {
 /// check (ops 0-13, kept so a single card still can't be picked twice in co-op), a card marked by
 /// patch_ap_cards returns true (op 76) instead of checking its bonus. Must run after
 /// patch_ap_cards, which adds the `apCardMarked` field.
-pub fn patch_ap_card_selectable(code: &mut Bytecode, _env: &Env) -> Result<()> {
+///
+/// Safety net (Bifrost mode active only): a perk card the local player already owns stays
+/// pickable too (ConquestBonus branch, op 33), and patch_perk_pick turns that pick into
+/// "nothing". Objective offers already leave out perks anyone owns (see rewards.rs), so this
+/// only matters if a player gets the perk while the screen is open or every pool ran dry: the
+/// screen can then still be confirmed instead of soft locking.
+pub fn patch_ap_card_selectable(code: &mut Bytecode, env: &Env) -> Result<()> {
     let findex = find_method_findex(code, "ui.elt.BifrostBonusButton", "canBeSelected")?;
     let (field_marked, marked_ty) = find_field_by_name(code, "ui.elt.BifrostBonusButton", "apCardMarked")?;
     let f = function(code, findex, "BifrostBonusButton.canBeSelected")?;
@@ -1323,17 +1350,44 @@ pub fn patch_ap_card_selectable(code: &mut Bytecode, _env: &Env) -> Result<()> {
         && matches!(o[14], GetThis { .. })
         && matches!(o[17], Switch { .. })
         && matches!(o[76], Bool { value: true, .. })
-        && matches!(o[77], Ret { .. });
+        && matches!(o[77], Ret { .. })
+        && matches!(o[32], Call4 { dst, arg0, arg1, arg2, .. } if dst == Reg(3) && arg0 == Reg(10) && arg1 == Reg(9) && arg2 == Reg(13))
+        && matches!(o[33], Ret { ret } if ret == Reg(3));
     if !shape_ok {
         bail!("canBeSelected shape changed. Northgard build mismatch?");
     }
-    let mut regs = Regs::new(f.regs.len());
+    let fn_has = find_method_findex(code, "gamesys.bifrost.BifrostBonusManager", "playerHasBonus")?;
+    let nregs = f.regs.len();
+    let active = konst(code, &path_in(&env.bifrost_dir, ACTIVE_FLAG_NAME));
+    let mut regs = Regs::new(nregs);
     let r_marked = regs.alloc(marked_ty);
+    let sc = Scratch::new(env, &mut regs);
+    let r_tmp = regs.alloc(env.string_ty);
+    let r_has = regs.alloc(env.bool_ty);
+    let owned_block = {
+        let mut a = Assembler::new();
+        let ret = a.label();
+        a.jump(JTrue { cond: Reg(3), offset: 0 }, ret);
+        emit_require_active(&mut a, env, &sc, active, r_tmp, ret);
+        a.op(Call3 { dst: r_has, fun: RefFun(fn_has), arg0: Reg(10), arg1: Reg(9), arg2: Reg(13) });
+        a.jump(JFalse { cond: r_has, offset: 0 }, ret);
+        a.op(Bool { dst: Reg(3), value: true });
+        a.bind(ret);
+        let mut ops = a.finish()?;
+        ops.push(o[33].clone());
+        ops
+    };
     let mut a = Assembler::new();
     a.op(GetThis { dst: r_marked, field: field_marked });
     a.jump_original(JTrue { cond: r_marked, offset: 0 }, 76);
     let (mut block, external) = a.finish_with_externals()?;
     block.push(o[14].clone());
-    let (ops, old_of_new) = splice(&o, vec![Replacement { at: 14, block, external }])?;
+    let (ops, old_of_new) = splice(
+        &o,
+        vec![
+            Replacement { at: 14, block, external },
+            Replacement { at: 33, block: owned_block, external: Vec::new() },
+        ],
+    )?;
     install(code, findex, ops, regs.new, |i| old_of_new[i])
 }

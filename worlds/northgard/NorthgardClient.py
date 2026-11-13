@@ -854,7 +854,7 @@ class NorthgardContext(SuperContext):
             if not _patch_check_lock.locked():
                 threading.Thread(target=_ensure_game_patched, daemon=True).start()
         elif cmd == "LocationInfo":
-            # Scouted AP card items (see _bifrost_tick): tooltip text for the patched perk screen.
+            # Scouted items (see _bifrost_tick): AP card tooltips and progression priority.
             for item in args.get("locations", []):
                 self.bifrost_scouts[item.location] = item
             if self.game_mode == "bifrost" and _room_key(self) is not None:
@@ -1072,10 +1072,11 @@ async def _bifrost_tick(ctx: NorthgardContext) -> None:
     if _room_key(ctx) is None:
         return  # no slot yet: never write one slot's state or send its checks for another
     if not ctx.bifrost_scouted:
-        # Every unchecked AP card's item, once per connection, for the perk screen tooltips.
-        card_ids = bifrost_client.card_location_ids(ctx)
-        if card_ids:
-            await ctx.send_msgs([{"cmd": "LocationScouts", "locations": card_ids, "create_as_hint": 0}])
+        # Every unchecked location's item, once per connection (no hints): AP card tooltips,
+        # and which objectives and realms hold progression, so the game brings those up first.
+        scout_ids = bifrost_client.scout_location_ids(ctx)
+        if scout_ids:
+            await ctx.send_msgs([{"cmd": "LocationScouts", "locations": scout_ids, "create_as_hint": 0}])
         ctx.bifrost_scouted = True
     bifrost_client.sync_markers(ctx, _CONFIG_DIR)
     names = bifrost_client.collect_done(_CONFIG_DIR)

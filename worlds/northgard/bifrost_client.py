@@ -7,6 +7,9 @@ there. In short, under <Saved Games>\\Archipelago\\Northgard\\bifrost\\ this cli
   realm_<Realm>           realm unlocked (Midgard always, the others by item)
   loc_<Realm>             realm still has an unchecked location (realm offer priority)
   obj_<Realm>_<ObjId>     objective still has an unchecked location there (spawn priority)
+  objmain_<Realm>_<ObjId> the objective's own check is unchecked (ahead of reward-card-only ones)
+  objprog_<Realm>_<ObjId> the objective or its reward card holds a progression item (spawns first)
+  prog_<Realm>            realm has an unchecked location holding a progression item (offered first)
   card_<Realm>_<Screen>_<K>  perk card position K of that screen is an unchecked location
   bonus_<Key>_<N>         the slot owns at least N copies of that bonus item
   scout_<Realm>_<Screen>_<K>.txt  tooltip text for that AP card: the item it holds
@@ -35,7 +38,7 @@ from .Locations import location_table
 if TYPE_CHECKING:
     from .NorthgardClient import NorthgardContext
 
-STATE_PREFIXES = ("realm_", "loc_", "obj_", "card_", "bonus_", "scout_")
+STATE_PREFIXES = ("realm_", "loc_", "obj_", "objmain_", "objprog_", "prog_", "card_", "bonus_", "scout_")
 ACTIVE_FLAG = "active.flag"
 
 
@@ -246,23 +249,32 @@ def desired_markers(ctx: "NorthgardContext") -> set[str]:
             wanted.add(f"realm_{realm}")
 
     realms_with_locations: set[str] = set()
-    objectives_with_locations: set[tuple[str, str]] = set()
     for loc in BIFROST_LOCATIONS:
-        if not location_enabled(loc, perk_setting) or _location_id(loc.name) not in missing:
+        loc_id = _location_id(loc.name)
+        if not location_enabled(loc, perk_setting) or loc_id not in missing:
             continue
         realms_with_locations.add(loc.realm)
+        # Scouted on connect (see scout_location_ids): progression items are sought out first.
+        item = ctx.bifrost_scouts.get(loc_id)
+        progression = item is not None and bool(item.flags & 1)
+        if progression:
+            wanted.add(f"prog_{loc.realm}")
+        objective = None
         if loc.kind == "objective":
-            objectives_with_locations.add((loc.realm, loc.objective))
+            objective = (loc.realm, loc.objective)
+            wanted.add(f"objmain_{loc.realm}_{loc.objective}")
         elif loc.kind == "card":
             wanted.add(loc.marker)
             # A reward screen with unchecked cards also makes its objective worth spawning.
             realm, _, screen = loc.screen.partition("_")
             if screen in REALM_OBJECTIVES.get(realm, []):
-                objectives_with_locations.add((realm, screen))
+                objective = (realm, screen)
+        if objective is not None:
+            wanted.add(f"obj_{objective[0]}_{objective[1]}")
+            if progression:
+                wanted.add(f"objprog_{objective[0]}_{objective[1]}")
     for realm in realms_with_locations:
         wanted.add(f"loc_{realm}")
-    for realm, oid in objectives_with_locations:
-        wanted.add(f"obj_{realm}_{oid}")
 
     for cat in BONUS_CATEGORIES:
         owned = min(received.count(cat.name), cat.cap)
@@ -276,13 +288,13 @@ def scout_file_name(card_marker: str) -> str:
     return "scout_" + card_marker[len("card_"):] + ".txt"
 
 
-def card_location_ids(ctx: "NorthgardContext") -> list[int]:
-    """This slot's unchecked perk card locations, for scouting their items."""
+def scout_location_ids(ctx: "NorthgardContext") -> list[int]:
+    """This slot's unchecked locations, for scouting their items: AP card tooltips, and which
+    objectives and realms hold progression (spawned and offered first)."""
     missing: set[int] = set(ctx.missing_locations)
     return [
         _location_id(loc.name) for loc in BIFROST_LOCATIONS
-        if loc.kind == "card" and location_enabled(loc, ctx.bifrost_perk_setting)
-        and _location_id(loc.name) in missing
+        if location_enabled(loc, ctx.bifrost_perk_setting) and _location_id(loc.name) in missing
     ]
 
 
