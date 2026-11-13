@@ -1089,6 +1089,9 @@ pub fn patch_ap_cards(code: &mut Bytecode, env: &Env) -> Result<()> {
     let bf_ty = obj_type(code, "gamesys.bifrost.BifrostManager")?;
     let array_obj_ty = obj_type(code, "hl.types.ArrayObj")?;
     let field_marked = add_field(code, "ui.elt.BifrostBonusButton", "apCardMarked", env.bool_ty)?;
+    let grey = GreyStyle::find(code)?;
+    let (field_dom, disabled_global, disabled_field, fn_remove_class) =
+        (grey.field_dom, grey.global, grey.field, grey.fn_remove_class);
     let (global_game, field_inst, game_global_ty, inst_ty) = {
         let f = function(code, find_method_findex(code, "$HBifrost", "pickObjective")?, "pickObjective")?;
         match (&f.ops[21], &f.ops[22]) {
@@ -1147,6 +1150,10 @@ pub fn patch_ap_cards(code: &mut Bytecode, env: &Env) -> Result<()> {
     let r_tip = regs.alloc(get_tip_ty);
     let r_layer = regs.alloc(icon_ty);
     let r_false = regs.alloc(env.bool_ty);
+    let r_dom = regs.alloc(grey.dom_ty);
+    let r_style_global = regs.alloc(grey.global_ty);
+    let r_style = regs.alloc(grey.style_ty);
+    let r_dom_ret = regs.alloc(grey.ret_ty);
 
     use Opcode::*;
     let mut a = Assembler::new();
@@ -1191,6 +1198,16 @@ pub fn patch_ap_cards(code: &mut Bytecode, env: &Env) -> Result<()> {
     emit_exists(&mut a, env, sc.boolean, r_path);
     a.jump(JFalse { cond: sc.boolean, offset: 0 }, next);
     a.op(SetField { obj: r_btn, field: field_marked, src: r_true });
+    // The game greys out a card it thinks can't be picked (e.g. a perk the player already got
+    // from a bonus item). An AP card is always pickable (see patch_ap_card_selectable), so drop
+    // the grey style it may have been built with.
+    a.op(Field { dst: r_dom, obj: r_btn, field: field_dom });
+    let no_dom = a.label();
+    a.jump(JNull { reg: r_dom, offset: 0 }, no_dom);
+    a.op(GetGlobal { dst: r_style_global, global: disabled_global });
+    a.op(Field { dst: r_style, obj: r_style_global, field: disabled_field });
+    a.op(Call2 { dst: r_dom_ret, fun: RefFun(fn_remove_class), arg0: r_dom, arg1: r_style });
+    a.bind(no_dom);
     // "This AP card was seen": the client hints its item on the server (new hints only).
     emit_str(&mut a, env, &sc, r_tmp, seen_prefix);
     emit_concat(&mut a, env, r_path, r_tmp, r_key);
@@ -1249,4 +1266,74 @@ pub fn patch_ap_cards(code: &mut Bytecode, env: &Env) -> Result<()> {
     let mut ops = a.finish()?;
     ops.extend(o);
     install(code, update, ops, regs.new, |i| i.saturating_sub(n))
+}
+
+/// The pieces of `BifrostBonusButton.greyOut(false)` that drop a card's grey "disabled" style:
+/// `this.dom.removeClass(<global>.DISABLED_STYLE)` (its ops 12-16), with the register types.
+struct GreyStyle {
+    field_dom: RefField,
+    global: hlbc::types::RefGlobal,
+    field: RefField,
+    fn_remove_class: usize,
+    dom_ty: RefType,
+    global_ty: RefType,
+    style_ty: RefType,
+    ret_ty: RefType,
+}
+
+impl GreyStyle {
+    fn find(code: &Bytecode) -> Result<Self> {
+        let findex = find_method_findex(code, "ui.elt.BifrostBonusButton", "greyOut")?;
+        let f = function(code, findex, "BifrostBonusButton.greyOut")?;
+        match (f.ops.get(12), f.ops.get(14), f.ops.get(15), f.ops.get(16)) {
+            (
+                Some(Opcode::GetThis { dst: dom, field: field_dom }),
+                Some(Opcode::GetGlobal { dst: g, global }),
+                Some(Opcode::Field { dst: s, field, .. }),
+                Some(Opcode::Call2 { dst: ret, fun, .. }),
+            ) => Ok(GreyStyle {
+                field_dom: *field_dom,
+                global: *global,
+                field: *field,
+                fn_remove_class: fun.0,
+                dom_ty: f.regs[dom.0 as usize],
+                global_ty: f.regs[g.0 as usize],
+                style_ty: f.regs[s.0 as usize],
+                ret_ty: f.regs[ret.0 as usize],
+            }),
+            _ => bail!("BifrostBonusButton.greyOut ops 12-16 changed. Northgard build mismatch?"),
+        }
+    }
+}
+
+/// `BifrostBonusButton.canBeSelected`: an AP card can always be picked. The game rejects a card
+/// whose bonus the player already owns or can't use, which an AP card's hidden perk can be (most
+/// often a perk the player already got from a bonus item): the card was greyed out and clicking
+/// it did nothing, so its location could never be checked. After the "already picked by someone"
+/// check (ops 0-13, kept so a single card still can't be picked twice in co-op), a card marked by
+/// patch_ap_cards returns true (op 76) instead of checking its bonus. Must run after
+/// patch_ap_cards, which adds the `apCardMarked` field.
+pub fn patch_ap_card_selectable(code: &mut Bytecode, _env: &Env) -> Result<()> {
+    let findex = find_method_findex(code, "ui.elt.BifrostBonusButton", "canBeSelected")?;
+    let (field_marked, marked_ty) = find_field_by_name(code, "ui.elt.BifrostBonusButton", "apCardMarked")?;
+    let f = function(code, findex, "BifrostBonusButton.canBeSelected")?;
+    let o = f.ops.clone();
+    use Opcode::*;
+    let shape_ok = o.len() == 80
+        && matches!(o[14], GetThis { .. })
+        && matches!(o[17], Switch { .. })
+        && matches!(o[76], Bool { value: true, .. })
+        && matches!(o[77], Ret { .. });
+    if !shape_ok {
+        bail!("canBeSelected shape changed. Northgard build mismatch?");
+    }
+    let mut regs = Regs::new(f.regs.len());
+    let r_marked = regs.alloc(marked_ty);
+    let mut a = Assembler::new();
+    a.op(GetThis { dst: r_marked, field: field_marked });
+    a.jump_original(JTrue { cond: r_marked, offset: 0 }, 76);
+    let (mut block, external) = a.finish_with_externals()?;
+    block.push(o[14].clone());
+    let (ops, old_of_new) = splice(&o, vec![Replacement { at: 14, block, external }])?;
+    install(code, findex, ops, regs.new, |i| old_of_new[i])
 }

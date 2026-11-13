@@ -116,7 +116,9 @@ const FILLER_SEEN_FIELD_PREFIX: &str = "apFillerSeen_";
 // choice-type constants; 17 = testing aids (/debugwave, /debugreward hook) removed.
 // 18 = granted records stamped with the run save's step, so bonus items granted in a lost or
 // reloaded realm are granted again (pool categories included); legacy pool records re-rolled.
-const PATCH_VERSION: u32 = 18;
+// 19 = AP cards are always pickable (an owned or incompatible hidden perk no longer greys them
+// out and blocks the check).
+const PATCH_VERSION: u32 = 19;
 const PATCH_VERSION_STAMP_PREFIX: &str = "ArchipelagoNorthgardPatchVersion=";
 
 /// The PATCH_VERSION stamped into `code` by cmd_apply, or None if it has none (vanilla, or

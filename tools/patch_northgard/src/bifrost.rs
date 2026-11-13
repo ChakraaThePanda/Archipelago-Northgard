@@ -361,6 +361,7 @@ pub fn apply_all(code: &mut Bytecode, env: &Env) -> Result<()> {
     items::patch_perk_pick(code, env)?;
     items::patch_bonus_items(code, env)?;
     items::patch_ap_cards(code, env)?;
+    items::patch_ap_card_selectable(code, env)?;
     Ok(())
 }
 
