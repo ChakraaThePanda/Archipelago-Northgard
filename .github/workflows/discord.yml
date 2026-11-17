@@ -1,4 +1,5 @@
-# Posts new commits and published releases to the project's Discord channel as embeds.
+# Posts to the project's Discord channel as embeds: published releases, or new commits for
+# projects that have never published a release.
 # Needs a DISCORD_WEBHOOK repository secret (the channel's webhook URL); skips without it.
 # Run it manually to re-post the latest release, or a specific one by tag.
 name: Discord posts
@@ -28,9 +29,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Post commits to Discord
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "$DISCORD_WEBHOOK" ]; then
             echo "DISCORD_WEBHOOK secret is not set, skipping"
+            exit 0
+          fi
+          # projects with releases only announce those; commits are posted for projects without any
+          releases="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq 'map(select(.draft | not)) | length')"
+          if [ "$releases" != 0 ]; then
+            echo "This project publishes releases, so commits are not posted"
             exit 0
           fi
           if [ "$(jq '.commits | length' "$GITHUB_EVENT_PATH")" = 0 ]; then
